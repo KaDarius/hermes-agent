@@ -367,6 +367,58 @@ def _read_process_cmdline(pid: int) -> Optional[str]:
     return None
 
 
+def _normalize_command_tokens(command: str | None) -> list[str]:
+    """Quote-aware tokenize + normalize a process command line.
+
+    Tokenizes with ``shlex`` so quoted Windows paths with spaces
+    (``"C:\\Program Files\\...\\hermes-gateway.exe"``) survive, then strips
+    surrounding quotes and normalizes slashes + case per token. Returns
+    ``[]`` for empty/``None`` input.
+    """
+    if not command:
+        return []
+    try:
+        raw_tokens = shlex.split(command, posix=False)
+    except ValueError:
+        raw_tokens = command.split()
+    return [t.strip("\"'").replace("\\", "/").lower() for t in raw_tokens]
+
+
+def _is_hermes_cli_entrypoint(tokens: list[str]) -> bool:
+    """True when normalized tokens invoke the Hermes CLI module or console
+    script (``hermes_cli.main``, ``hermes_cli/main.py``, or the
+    ``hermes``/``hermes.exe`` basename)."""
+    joined = " ".join(tokens)
+    return (
+        "hermes_cli.main" in joined
+        or "hermes_cli/main.py" in joined
+        or any(t.rsplit("/", 1)[-1] in ("hermes", "hermes.exe") for t in tokens)
+    )
+
+
+def _strip_profile_selectors(tokens: list[str]) -> list[str]:
+    """Drop ``--profile``/``-p`` selectors from anywhere in argv.
+
+    Hermes's ``_apply_profile_override`` removes them before argparse, so the
+    profile flag (and a profile literally named ``gateway`` or ``serve``) can
+    legally appear on either side of the real subcommand token: ``--profile X
+    / -p X / --profile=X / -p=X``.
+    """
+    filtered: list[str] = []
+    skip_next = False
+    for token in tokens:
+        if skip_next:
+            skip_next = False
+            continue
+        if token in ("--profile", "-p"):
+            skip_next = True
+            continue
+        if token.startswith("--profile=") or token.startswith("-p="):
+            continue
+        filtered.append(token)
+    return filtered
+
+
 def _gateway_command_subcommand(command: str | None) -> str | None:
     """Return the Hermes gateway lifecycle subcommand from a command line.
 
@@ -380,22 +432,13 @@ def _gateway_command_subcommand(command: str | None) -> str | None:
     ``gateway`` management subcommands and any process that merely contains the
     word "gateway".
 
-    Tokenizes quote-aware (``shlex``) so quoted Windows paths with spaces
-    (``"C:\\Program Files\\...\\hermes-gateway.exe"``) survive, and strips
-    ``--profile``/``-p`` selectors from anywhere in argv -- Hermes's
-    ``_apply_profile_override`` removes them before argparse, so the profile
-    flag (and a profile literally named ``gateway``) can legally appear on
-    either side of the ``gateway`` subcommand.
+    Tokenizes quote-aware and strips ``--profile``/``-p`` selectors from
+    anywhere in argv (see ``_normalize_command_tokens`` /
+    ``_strip_profile_selectors``) so the profile flag (and a profile literally
+    named ``gateway``) can legally appear on either side of the ``gateway``
+    subcommand.
     """
-    if not command:
-        return None
-
-    try:
-        raw_tokens = shlex.split(command, posix=False)
-    except ValueError:
-        raw_tokens = command.split()
-    # Strip surrounding quotes, normalize slashes + case per token.
-    tokens = [t.strip("\"'").replace("\\", "/").lower() for t in raw_tokens]
+    tokens = _normalize_command_tokens(command)
     if not tokens:
         return None
 
@@ -407,31 +450,10 @@ def _gateway_command_subcommand(command: str | None) -> str | None:
         if basename in ("hermes-gateway", "hermes-gateway.exe"):
             return "run"
 
-    joined = " ".join(tokens)
-    has_gateway_entry = (
-        "hermes_cli.main" in joined
-        or "hermes_cli/main.py" in joined
-        or any(t.rsplit("/", 1)[-1] in ("hermes", "hermes.exe") for t in tokens)
-    )
-    if not has_gateway_entry:
+    if not _is_hermes_cli_entrypoint(tokens):
         return None
 
-    # Drop profile selectors anywhere: --profile X / -p X / --profile=X / -p=X.
-    # This consumes a profile VALUE of "gateway" too, so the real subcommand
-    # token is the one we land on below.
-    filtered: list[str] = []
-    skip_next = False
-    for token in tokens:
-        if skip_next:
-            skip_next = False
-            continue
-        if token in ("--profile", "-p"):
-            skip_next = True
-            continue
-        if token.startswith("--profile=") or token.startswith("-p="):
-            continue
-        filtered.append(token)
-
+    filtered = _strip_profile_selectors(tokens)
     for i, token in enumerate(filtered):
         if token != "gateway":
             continue
@@ -439,6 +461,27 @@ def _gateway_command_subcommand(command: str | None) -> str | None:
             return "run"  # bare `hermes gateway` defaults to `run`
         return filtered[i + 1]
     return None
+
+
+def looks_like_serve_command_line(command: str | None) -> bool:
+    """Return True for a real Hermes ``serve`` backend process command line.
+
+    ``serve`` is the Hermes Desktop app's headless backend subcommand (a
+    sibling of ``gateway``, not nested under it) — spawned as
+    ``hermes_cli.main serve ...`` or, per-profile, ``hermes_cli.main
+    --profile <name> serve ...`` (``apps/desktop/electron/main.ts``).  Like
+    ``_gateway_command_subcommand``, this tokenizes quote-aware and strips
+    ``--profile``/``-p`` selectors from anywhere in argv before checking for
+    the ``serve`` token, and requires a real Hermes CLI entrypoint so it
+    doesn't false-match an unrelated process that merely contains the word
+    "serve" (KDTSK-1793 F2 — a loose substring match silently missed every
+    ``--profile``-qualified spawn shape).
+    """
+    tokens = _normalize_command_tokens(command)
+    if not tokens or not _is_hermes_cli_entrypoint(tokens):
+        return False
+    filtered = _strip_profile_selectors(tokens)
+    return "serve" in filtered
 
 
 def looks_like_gateway_command_line(command: str | None) -> bool:

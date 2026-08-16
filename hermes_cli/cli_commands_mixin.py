@@ -1546,6 +1546,7 @@ class CLICommandsMixin:
         from cli import get_job
         import shlex
         from tools.cronjob_tools import cronjob as cronjob_tool
+        from hermes_cli.cron import _refuse_if_live_scheduler_owns_state
 
         def _cron_api(**kwargs):
             return json.loads(cronjob_tool(**kwargs))
@@ -1570,6 +1571,7 @@ class CLICommandsMixin:
                 "all": False,
                 "prompt": None,
                 "schedule": None,
+                "force_file_write": False,
                 "positionals": [],
             }
             i = 0
@@ -1609,6 +1611,9 @@ class CLICommandsMixin:
                 elif token == "--schedule" and i + 1 < len(tokens):
                     opts["schedule"] = tokens[i + 1]
                     i += 2
+                elif token == "--force-file-write":
+                    opts["force_file_write"] = True
+                    i += 1
                 else:
                     opts["positionals"].append(token)
                     i += 1
@@ -1683,6 +1688,8 @@ class CLICommandsMixin:
             return
 
         if subcommand in {"add", "create"}:
+            if _refuse_if_live_scheduler_owns_state(opts["force_file_write"]):
+                return
             positionals = opts["positionals"]
             if not positionals:
                 print("(._.) Usage: /cron add <schedule> <prompt>")
@@ -1713,6 +1720,8 @@ class CLICommandsMixin:
             return
 
         if subcommand == "edit":
+            if _refuse_if_live_scheduler_owns_state(opts["force_file_write"]):
+                return
             positionals = opts["positionals"]
             if not positionals:
                 print("(._.) Usage: /cron edit <job_id> [--schedule ...] [--prompt ...] [--skill ...]")
@@ -1761,6 +1770,8 @@ class CLICommandsMixin:
             return
 
         if subcommand in {"pause", "resume", "run", "remove", "rm", "delete"}:
+            if _refuse_if_live_scheduler_owns_state(opts["force_file_write"]):
+                return
             positionals = opts["positionals"]
             if not positionals:
                 print(f"(._.) Usage: /cron {subcommand} <job_id>")

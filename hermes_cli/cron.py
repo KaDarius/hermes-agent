@@ -6,9 +6,11 @@ pause/resume/run/remove, status, and tick.
 """
 
 import json
+import os
+import subprocess
 import sys
 from pathlib import Path
-from typing import Iterable, List, Optional
+from typing import Iterable, List, Optional, Tuple
 
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -24,6 +26,192 @@ from hermes_cli.colors import Colors, color
 from cron.lifecycle_guard import (  # noqa: F401  (re-exported for terminal_tool)
     contains_gateway_lifecycle_command as _contains_gateway_lifecycle_command,
 )
+
+
+# KDTSK-1793: a live scheduler process holds the cron job set in memory and
+# periodically flushes it back over ~/.hermes/cron/jobs.json, silently
+# reverting any CLI mutation that landed between reads. The two known
+# owners are the Hermes Desktop app's headless backend (``hermes_cli.main
+# serve``) and the launchd-managed gateway (``hermes_cli.main gateway
+# run``).
+#
+# F2 fix: matched via ``gateway.status``'s quote-aware, ``--profile``-
+# stripping tokenizer (``looks_like_gateway_command_line`` /
+# ``looks_like_serve_command_line``) rather than a loose substring list. A
+# substring match on "hermes_cli.main serve"/"hermes_cli.main gateway run"
+# silently misses every real per-profile spawn shape — the Desktop app
+# (``apps/desktop/electron/main.ts``) launches
+# ``hermes_cli.main --profile <name> serve ...`` and launchd plists
+# (``ai.hermes.gateway-<profile>.plist``) launch
+# ``hermes_cli.main --profile <name> gateway run --replace`` — which put the
+# profile flag BETWEEN the entrypoint and the subcommand, breaking the old
+# adjacent-substring check and returning zero owners exactly when a
+# profile-scoped scheduler is the one that would revert the edit.
+def _is_live_scheduler_command_line(cmdline: str) -> bool:
+    """True when a process command line is a live cron-scheduler owner —
+    the Desktop app's ``serve`` backend or a ``gateway run`` process, any
+    profile. See the module-level KDTSK-1793 F2 note above."""
+    from gateway.status import looks_like_gateway_command_line, looks_like_serve_command_line
+
+    return looks_like_gateway_command_line(cmdline) or looks_like_serve_command_line(cmdline)
+
+
+# F9: exclude cmdlines that are clearly a process-table MATCHER, not a real
+# scheduler — a `ps`/`grep`/`pkill` invocation that happens to contain our
+# own search text (e.g. `grep -i hermes_cli.main serve`) tokenizes as a real
+# "serve" argv just as validly as the process it's searching for. Applied to
+# BOTH the psutil path and the ps-fallback path (the psutil path is the only
+# one that actually runs in this environment — psutil is installed — so it
+# must not be the one missing this filter).
+_SELF_NOISE_MARKERS: Tuple[str, ...] = ("grep", "pkill")
+
+
+def _is_scheduler_detector_self_noise(cmdline: str) -> bool:
+    """True when ``cmdline`` is a matcher process (grep/pkill) or this CLI's
+    own invocation, not a genuine live-scheduler owner."""
+    lowered = cmdline.lower()
+    if any(marker in lowered for marker in _SELF_NOISE_MARKERS):
+        return True
+    try:
+        own_argv = " ".join(sys.argv).strip().lower()
+    except Exception:
+        own_argv = ""
+    if own_argv and own_argv in lowered:
+        return True
+    return False
+
+
+def _detect_live_cron_scheduler_owners() -> List[Tuple[int, str]]:
+    """Best-effort scan for live processes that own the in-memory cron
+    scheduler state and would silently revert a file-only CLI edit.
+
+    Prefers ``psutil`` (already a core Hermes dependency — see the same
+    import-guard pattern in ``hermes_cli.gateway._filter_venv_launcher_stubs``)
+    and falls back to parsing ``ps -Axo pid,command`` so this never hard-
+    depends on a new package. Returns ``[]`` (never raises) on any scan
+    failure — a detector that can't tell should stay quiet rather than block
+    every cron mutation.
+
+    Known limitation (KDTSK-1793 F4, documented rather than fixed): this
+    scan is NOT scoped to the current Hermes profile/``HERMES_HOME``. A
+    different profile's live scheduler (e.g. profile "aegis"'s gateway) will
+    be detected and can refuse an edit intended for a job under a different
+    profile's jobs.json, even though that scheduler doesn't actually own the
+    file being edited. This is a false positive, not a false negative — it
+    over-refuses rather than silently losing a write, which is the safe
+    direction for this guard. A precise fix needs environment inspection
+    (``ps -A eww`` to read each candidate's ``HERMES_HOME``/``--profile``
+    and compare against the current invocation's resolved profile) and is
+    intentionally deferred rather than built here.
+    """
+    self_pid = os.getpid()
+    owners: List[Tuple[int, str]] = []
+
+    try:
+        import psutil  # type: ignore
+
+        for proc in psutil.process_iter(["pid", "cmdline"]):
+            try:
+                pid = proc.info["pid"]
+                if pid == self_pid:
+                    continue
+                cmdline = " ".join(proc.info.get("cmdline") or [])
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
+            if not cmdline or _is_scheduler_detector_self_noise(cmdline):
+                continue
+            if _is_live_scheduler_command_line(cmdline):
+                owners.append((pid, cmdline))
+        return owners
+    except ImportError:
+        pass
+    except Exception:
+        return []
+
+    try:
+        result = subprocess.run(
+            ["ps", "-Axo", "pid,command"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return []
+
+    if result.returncode != 0 or not result.stdout:
+        return []
+
+    for line in result.stdout.splitlines()[1:]:  # skip the ps header row
+        stripped = line.strip()
+        if not stripped:
+            continue
+        parts = stripped.split(None, 1)
+        if len(parts) != 2:
+            continue
+        try:
+            pid = int(parts[0])
+        except ValueError:
+            continue
+        if pid == self_pid:
+            continue
+        command = parts[1]
+        if _is_scheduler_detector_self_noise(command):
+            continue
+        if _is_live_scheduler_command_line(command):
+            owners.append((pid, command))
+    return owners
+
+
+def _refuse_if_live_scheduler_owns_state(force_file_write: bool) -> bool:
+    """Print and return ``True`` when a cron mutation must be aborted
+    because a live scheduler owns the job state (KDTSK-1793).
+
+    ``force_file_write=True`` bypasses the refusal (prints a warning
+    instead) — the caller accepts the edit may be silently reverted.
+
+    Known limitation (F4): the detector is not profile-scoped, so a
+    different profile's live scheduler can trigger a refusal for an edit it
+    doesn't actually own (a false positive). This is deliberately left as
+    the safe-side failure mode — over-refusing never silently loses a
+    write — rather than adding environment inspection to disambiguate
+    profiles right now. See ``_detect_live_cron_scheduler_owners`` docstring.
+    """
+    owners = _detect_live_cron_scheduler_owners()
+    if not owners:
+        return False
+
+    from gateway.status import looks_like_gateway_command_line
+
+    described = []
+    for pid, cmdline in owners:
+        label = (
+            "hermes_cli.main gateway run"
+            if looks_like_gateway_command_line(cmdline)
+            else "hermes_cli.main serve"
+        )
+        described.append(f"pid {pid}, {label}")
+    owner_desc = "; ".join(described)
+
+    if force_file_write:
+        print(color(
+            f"⚠  A live Hermes scheduler ({owner_desc}) owns the cron job "
+            "state and may overwrite this file edit on its next flush. "
+            "Proceeding because --force-file-write was passed.",
+            Colors.YELLOW,
+        ))
+        return False
+
+    print(color(
+        f"REFUSED: a live Hermes scheduler ({owner_desc}) owns the cron job "
+        "state and will overwrite file edits. Make the change in the Hermes "
+        "desktop app, or stop it first (quit app / launchctl bootout "
+        "gui/$UID/ai.hermes.gateway), or re-run with --force-file-write if "
+        "you accept the change may be silently reverted.",
+        Colors.RED,
+    ))
+    return True
 
 
 def _normalize_skills(single_skill=None, skills: Optional[Iterable[str]] = None) -> Optional[List[str]]:
@@ -342,6 +530,9 @@ def _print_active_jobs_summary(jobs) -> None:
 
 
 def cron_create(args):
+    if _refuse_if_live_scheduler_owns_state(getattr(args, "force_file_write", False)):
+        return 1
+
     # The gateway-lifecycle guard lives in cron.jobs.create_job so it fires on
     # every job-creation path (this CLI subcommand AND the agent's `cronjob`
     # model tool, which calls create_job directly). When it blocks, create_job
@@ -390,6 +581,9 @@ def cron_create(args):
 
 
 def cron_edit(args):
+    if _refuse_if_live_scheduler_owns_state(getattr(args, "force_file_write", False)):
+        return 1
+
     from cron.jobs import AmbiguousJobReference, resolve_job_ref
 
     try:
@@ -615,15 +809,28 @@ def cron_command(args):
         return cron_edit(args)
 
     if subcmd == "pause":
+        if _refuse_if_live_scheduler_owns_state(getattr(args, "force_file_write", False)):
+            return 1
         return _job_action("pause", args.job_id, "Paused")
 
     if subcmd == "resume":
+        if _refuse_if_live_scheduler_owns_state(getattr(args, "force_file_write", False)):
+            return 1
         return _job_action("resume", args.job_id, "Resumed")
 
     if subcmd == "run":
+        # F5: `run` mutates persisted state too (tools/cronjob_tools.py's
+        # run/run_now/trigger claim advances next_run_at and rewrites
+        # last_run_at/last_status), so it is subject to the same silent
+        # revert as edit/pause/resume/remove/create. The invariant is "every
+        # jobs.json mutation is guarded" — not a per-subcommand allowlist.
+        if _refuse_if_live_scheduler_owns_state(getattr(args, "force_file_write", False)):
+            return 1
         return _job_action("run", args.job_id, "Triggered")
 
     if subcmd in {"remove", "rm", "delete"}:
+        if _refuse_if_live_scheduler_owns_state(getattr(args, "force_file_write", False)):
+            return 1
         return _job_action("remove", args.job_id, "Removed")
 
     print(f"Unknown cron command: {subcmd}")
