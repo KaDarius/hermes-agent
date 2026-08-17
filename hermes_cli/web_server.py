@@ -16843,6 +16843,10 @@ def mount_spa(application: FastAPI):
             else "Frontend not built. Run: cd web && npm run build"
         )
 
+        # Headless liveness alias: bare /health mirrors /api/health so fleet
+        # probes don't need the /api prefix (KD-approved 2026-08-17).
+        application.get("/health")(get_health)
+
         @application.get("/{full_path:path}")
         async def no_frontend(full_path: str):
             return JSONResponse({"error": _msg}, status_code=404)
