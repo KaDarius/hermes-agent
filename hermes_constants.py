@@ -1357,6 +1357,13 @@ def resolve_reasoning_config(cfg: dict | None, model: str = "") -> dict | None:
     if per_model is not None:
         return per_model
 
+    # Known non-reasoning models: if model is known to reject thinking/reasoning
+    # parameters (and has no explicit override), return disabled to prevent HTTP 400 crashes.
+    _model_lower = (model or "").lower()
+    _non_reasoning_prefixes = ("phi3", "phi-3", "phi4", "phi-4", "llama-3", "llama-2", "mistral", "gemma", "gpt-3.5", "claude-3-haiku", "haiku")
+    if any(p in _model_lower for p in _non_reasoning_prefixes) and not any(r in _model_lower for r in ("r1", "reasoning", "thinking")):
+        return {"enabled": False, "effort": "none"}
+
     # Global fallback — keep the raw value; coercing with ``or ""`` turns a
     # YAML boolean False into "", silently re-enabling thinking for users
     # who explicitly disabled it.
