@@ -5736,6 +5736,22 @@ def run_conversation(
                 ) and not is_context_length_error
 
                 if is_client_error:
+                    # Thinking / reasoning parameter rejection recovery:
+                    # If endpoint rejects reasoning parameters (HTTP 400 'does not support thinking' or reasoning_effort),
+                    # strip reasoning config and retry immediately.
+                    if (
+                        status_code == 400
+                        and any(kw in error_msg for kw in ('does not support thinking', 'thinking is not supported', 'reasoning_effort', 'unexpected parameter: think'))
+                        and getattr(agent, 'reasoning_config', None)
+                        and agent.reasoning_config.get('enabled', False)
+                    ):
+                        agent.reasoning_config = {'enabled': False, 'effort': 'none'}
+                        agent._buffer_vprint(
+                            f"🧠 Model '{_model}' does not support thinking parameters — stripped reasoning config and retrying..."
+                        )
+                        retry_count = 0
+                        continue
+
                     # Copilot self-heal BEFORE fallback: a stale/degraded
                     # credential surfaces as a 400
                     # ``model_not_available_for_integrator`` /
