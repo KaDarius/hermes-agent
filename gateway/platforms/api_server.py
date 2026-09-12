@@ -1614,6 +1614,29 @@ class APIServerAdapter(BasePlatformAdapter):
         self._browser_control_artifacts: Dict[str, ArtifactStore] = {}
         self._browser_control_artifact_limiter: Optional[ArtifactRateLimiter] = None
 
+    def strict_active_agent_work_count(self) -> int:
+        """Read admission registries without converting unknown state to idle.
+
+        Maintenance observations use this on the owning event loop. Keep the
+        legacy best-effort counter separate for existing shutdown callers.
+        """
+        from collections.abc import Mapping
+
+        pending = self._pending_agent_requests
+        inflight = self._inflight_agent_runs
+        if any(type(value) is not int or value < 0 for value in (pending, inflight)):
+            raise ValueError("invalid API work counter")
+        tasks = self._active_run_tasks
+        if not isinstance(tasks, Mapping):
+            raise ValueError("invalid API task registry")
+        active = 0
+        for task in tasks.values():
+            done = task.done()
+            if type(done) is not bool:
+                raise ValueError("invalid API task state")
+            active += not done
+        return pending + inflight + active
+
     def active_agent_work_count(self) -> int:
         """Return all live agent work owned by this API adapter.
 

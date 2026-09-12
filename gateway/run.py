@@ -9147,7 +9147,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         def api_count():
             adapter = self.adapters.get(Platform.API_SERVER)
-            return adapter.active_agent_work_count()
+            return adapter.strict_active_agent_work_count()
 
         counters = {}
         for name, read in (("messaging", messaging_count), ("cron", cron_count), ("api", api_count)):
