@@ -61,6 +61,104 @@ class TransactionTests(unittest.TestCase):
         result=subprocess.run([sys.executable,'-B','-c',code,str(self.profile)],cwd=Path(__file__).resolve().parents[2],capture_output=True,text=True,encoding='utf-8',timeout=5)
         self.assertEqual(result.returncode,0,result.stderr)
         self.assertEqual(result.stdout.strip(),'unsafe_path')
+    def test_nested_jobs_lock_rejects_replaced_lock_inode(self):
+        path = self.cron / '.jobs.lock'
+        lock = sut._JobsLock(path)
+        with lock():
+            path.unlink()
+            path.write_text('', encoding='utf-8')
+            with self.assertRaisesRegex(sut.Refused, 'lock_identity_changed'):
+                with lock():
+                    self.fail('replacement lock admitted a nested writer')
+
+    def test_lock_with_an_external_hardlink_is_refused(self):
+        path = self.cron / '.jobs.lock'
+        path.write_text('', encoding='utf-8')
+        path.chmod(0o600)
+        os.link(path, self.root / 'alias.lock')
+        with self.assertRaisesRegex(sut.Refused, 'unsafe_lock'):
+            with sut._file_lock(path):
+                self.fail('hardlinked lock accepted')
+
+    def test_expired_lock_validator_cannot_be_reused(self):
+        with sut._file_lock(self.cron / '.jobs.lock') as check:
+            check()
+        with self.assertRaisesRegex(sut.Refused, 'lock_context_unavailable'):
+            check()
+
+    def test_nested_lock_from_another_thread_is_refused(self):
+        from concurrent.futures import ThreadPoolExecutor
+        lock = sut._JobsLock(self.cron / '.jobs.lock')
+        def enter():
+            with lock():
+                return 'incorrectly admitted'
+        with lock(), ThreadPoolExecutor(max_workers=1) as pool:
+            with self.assertRaisesRegex(sut.Refused, 'lock_context_unavailable'):
+                pool.submit(enter).result(timeout=5)
+
+    def test_replaced_fire_lock_refuses_actual_update(self):
+        original = self.store.read_bytes()
+        def replace_fire_lock():
+            fire = next(self.cron.glob('.fire-*.lock'))
+            fire.unlink()
+            fire.write_text('', encoding='utf-8')
+        with self.assertRaisesRegex(sut.Refused, 'lock_identity_changed'):
+            sut.apply(self.profile, self.backend, self.expected, self.payloads,
+                      self.backup, replace_fire_lock)
+        self.assertEqual(self.store.read_bytes(), original)
+        self.assertEqual(self.backend.calls, 0)
+        self.assertFalse(any(self.scripts.iterdir()))
+
+    def test_lock_loss_before_apply_does_not_publish_payloads(self):
+        def replace_fire():
+            fire = next(self.cron.glob('.fire-*.lock'))
+            fire.unlink()
+            fire.write_text('', encoding='utf-8')
+        with patch.object(sut, 'install_new', wraps=sut.install_new) as publish:
+            with self.assertRaisesRegex(sut.Refused, 'lock_identity_changed'):
+                sut.apply(self.profile, self.backend, self.expected, self.payloads,
+                          self.backup, replace_fire)
+            publish.assert_not_called()
+        self.assertFalse(self.backup.exists())
+
+    def test_resumed_rollback_preserves_files_after_lock_loss(self):
+        self.apply()
+        rows = self.rows()
+        rows[0] = self.target
+        self.store.write_text(json.dumps({'jobs': rows}), encoding='utf-8')
+        receipt_path = self.backup / 'transaction.json'
+        receipt = json.loads(receipt_path.read_text(encoding='utf-8'))
+        receipt['status'] = 'job_reverted_files_pending'
+        receipt_path.write_text(json.dumps(receipt), encoding='utf-8')
+        original_receipt = receipt_path.read_bytes()
+        def replace_fire():
+            fire = next(self.cron.glob('.fire-*.lock'))
+            fire.unlink()
+            fire.write_text('', encoding='utf-8')
+        with self.assertRaisesRegex(sut.Refused, 'lock_identity_changed'):
+            sut.rollback(self.profile, self.backend, self.backup, replace_fire)
+        self.assertTrue(all((self.scripts / name).exists() for name in self.payloads))
+        self.assertEqual(receipt_path.read_bytes(), original_receipt)
+
+    def test_lock_loss_after_publication_preserves_reconciliation_evidence(self):
+        calls = 0
+        def lose_before_writer():
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                fire = next(self.cron.glob('.fire-*.lock'))
+                fire.unlink()
+                fire.write_text('', encoding='utf-8')
+        with self.assertRaisesRegex(sut.Refused, 'lock_identity_changed'):
+            sut.apply(self.profile, self.backend, self.expected, self.payloads,
+                      self.backup, lose_before_writer)
+        self.assertEqual(self.backend.calls, 0)
+        self.assertEqual(self.rows()[0], self.target)
+        for name, data in self.payloads.items():
+            self.assertEqual((self.scripts / name).read_bytes(), data)
+        receipt = json.loads((self.backup / 'transaction.json').read_text(encoding='utf-8'))
+        self.assertEqual(receipt['status'], 'prepared')
+
     def test_nonfinite_peer_number_refused_before_mutation(self):
         raw=json.dumps({'jobs':[self.target,self.other]}).replace('"must survive"','1e999')
         self.store.write_text(raw, encoding="utf-8")

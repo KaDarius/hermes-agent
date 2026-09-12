@@ -18,6 +18,7 @@ from pathlib import Path
 import stat
 import sqlite3
 import tempfile
+import threading
 import uuid
 
 JOB_ID='8417d6710834'
@@ -84,30 +85,95 @@ def _paths(profile):
 
 @contextlib.contextmanager
 def _file_lock(path):
-    fd=None
+    """Yield a context-bound validator for this exact cooperating lock inode."""
+    path = Path(path).absolute()
+    fd = directory = None
+    active = False
+    owner = (os.getpid(), threading.get_ident())
     try:
-        fd=os.open(path,os.O_RDWR|os.O_CREAT|os.O_NOFOLLOW,0o600)
-        s=os.fstat(fd)
-        if not stat.S_ISREG(s.st_mode) or s.st_uid!=os.getuid():raise Refused('unsafe_lock')  # windows-footgun: ok — package import rejects non-POSIX hosts
-        try:fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
-        except OSError:raise Refused('lock_busy') from None
-        yield
+        root = path.parent.resolve()
+        if path.parent.is_symlink():
+            raise Refused('unsafe_lock_directory')
+        directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        parent = os.fstat(directory)
+        if parent.st_uid != os.getuid() or parent.st_mode & 0o022:  # windows-footgun: ok — package import rejects non-POSIX hosts
+            raise Refused('unsafe_lock_directory')
+        fd = os.open(path.name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
+                     0o600, dir_fd=directory)
+        opened = os.fstat(fd)
+
+        def safe(info):
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()  # windows-footgun: ok — package import rejects non-POSIX hosts
+                    or info.st_nlink != 1 or info.st_mode & 0o022):
+                raise Refused('unsafe_lock')
+
+        safe(opened)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            raise Refused('lock_busy') from None
+        active = True
+
+        def check():
+            if not active or owner != (os.getpid(), threading.get_ident()):
+                raise Refused('lock_context_unavailable')
+            try:
+                current_parent = path.parent.lstat()
+                current = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
+            except OSError:
+                raise Refused('lock_identity_changed') from None
+            if (path.parent.resolve() != root
+                    or not stat.S_ISDIR(current_parent.st_mode)
+                    or (parent.st_dev, parent.st_ino) != (current_parent.st_dev, current_parent.st_ino)
+                    or (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino)):
+                raise Refused('lock_identity_changed')
+            if current_parent.st_uid != os.getuid() or current_parent.st_mode & 0o022:  # windows-footgun: ok — package import rejects non-POSIX hosts
+                raise Refused('unsafe_lock_directory')
+            safe(current)
+
+        check()
+        yield check
     finally:
-        if fd is not None:os.close(fd)
+        active = False
+        if fd is not None:
+            os.close(fd)
+        if directory is not None:
+            os.close(directory)
+
 
 class _JobsLock:
-    def __init__(self,path):self.path=path;self.depth=0
+    def __init__(self, path):
+        self.path = path
+        self.depth = 0
+        self.check = None
+        self.additional_checks = ()
+
+    def require_valid(self):
+        if self.check is None:
+            raise Refused('lock_context_unavailable')
+        self.check()
+        for check in self.additional_checks:
+            check()
+
     @contextlib.contextmanager
     def __call__(self):
         if self.depth:
-            self.depth+=1
-            try:yield
-            finally:self.depth-=1
+            self.require_valid()
+            self.depth += 1
+            try:
+                yield
+            finally:
+                self.depth -= 1
         else:
-            with _file_lock(self.path):
-                self.depth=1
-                try:yield
-                finally:self.depth=0
+            with _file_lock(self.path) as check:
+                self.check = check
+                self.depth = 1
+                try:
+                    self.require_valid()
+                    yield
+                finally:
+                    self.depth = 0
+                    self.check = None
 
 @contextlib.contextmanager
 def _transaction(profile,backend):
@@ -117,10 +183,17 @@ def _transaction(profile,backend):
     old=(backend._jobs_lock,backend.load_jobs,backend.save_jobs)
     # Strict wrappers are scoped to this short-lived installer process. The
     # installed Hermes source and running gateway are never monkeypatched.
-    with _file_lock(fire),lock():
+    with _file_lock(fire) as fire_check, lock():
+        lock.additional_checks = (fire_check,)
+        def load():
+            lock.require_valid()
+            return copy.deepcopy(_store(profile)[1])
+        def save(rows):
+            lock.require_valid()
+            return old[2](rows)
         backend._jobs_lock=lock
-        backend.load_jobs=lambda:copy.deepcopy(_store(profile)[1])
-        try:yield old[2]
+        backend.load_jobs=load
+        try:yield save, lock.require_valid
         finally:backend._jobs_lock,backend.load_jobs,backend.save_jobs=old
 
 def _idle(row,check_idle):
@@ -181,33 +254,43 @@ def _owned_files(profile,payloads):
 def apply(profile,backend,expected_target_hash,payloads,backup,check_idle):
     profile=_paths(profile);backup=Path(backup)
     if set(payloads)!=FILES or any(not isinstance(b,bytes) or not b or len(b)>1024*1024 for b in payloads.values()):raise Refused('invalid_payload')
-    with _transaction(profile,backend) as native_save:
+    with _transaction(profile,backend) as (native_save, require_valid):
+        def journal(value):
+            require_valid()
+            _journal(backup, value)
         before_raw,rows=_store(profile);before=copy.deepcopy(_target(rows))
         if digest(before)!=expected_target_hash:raise Refused('target_drift')
         _idle(before,check_idle)
+        require_valid()
         if before.get('name')!='daily-command-hub' or before.get('script') is not None or before.get('no_agent') is not False:raise Refused('unexpected_target_mode')
         if any(k not in before for k in FIELDS) or any(before[k] is not None for k in FIELDS[2:]):raise Refused('unsupported_snapshot_state')
         if not all(isinstance(before.get(k),str) and before[k].strip() and before[k]==before[k].strip() for k in ['provider','model']):raise Refused('unpinned_provider')
         for name in FILES:
             p=profile/'scripts'/name
             if p.exists() or p.is_symlink():raise Refused('destination_exists')
+        require_valid()
         backup.mkdir(mode=0o700)
         _fsync_dir(backup.parent)
         receipt={'version':1,'profile':str(profile.resolve()),'job_id':JOB_ID,'before':before,'files':{n:{'before':'absent','sha256':hashlib.sha256(b).hexdigest()} for n,b in payloads.items()},'status':'prepared'}
-        _journal(backup,receipt)
+        journal(receipt)
         installed=[]
         try:
             for name,data in payloads.items():
+                require_valid()
                 install_new(profile/'scripts'/name,data,lambda:installed.append(name))
             _owned_files(profile,payloads)
             updates={'script':'hermes_daily_command_hub.py','no_agent':True}
             expected=dict(before,**updates,provider_snapshot=None,model_snapshot=None)
             # Repeat the active-execution check immediately before the writer.
             _idle(_target(_store(profile)[1]),check_idle)
+            require_valid()
             _update(profile,backend,native_save,rows,expected,updates)
-            receipt.update(status='installed',after=expected);_journal(backup,receipt)
+            receipt.update(status='installed',after=expected);journal(receipt)
             return {'status':'installed','job_id':JOB_ID,'target_sha256':digest(expected),'backup':str(backup)}
         except BaseException:
+            # Lost exclusion cannot authorize cleanup. Preserve evidence/files
+            # for reconciliation under a fresh, verified transaction.
+            require_valid()
             unchanged=False
             try:unchanged=_store(profile)[0]==before_raw
             except BaseException:pass
@@ -215,11 +298,12 @@ def apply(profile,backend,expected_target_hash,payloads,backup,check_idle):
                 for name in reversed(installed):
                     p=profile/'scripts'/name
                     if _read(p,1024*1024)!=payloads[name]:raise Refused('installed_file_drift') from None
+                    require_valid()
                     p.unlink()
-                receipt['status']='failed_before_job_change';_journal(backup,receipt)
+                receipt['status']='failed_before_job_change';journal(receipt)
                 _fsync_dir(profile/'scripts')
                 raise
-            receipt['status']='reconciliation_required';_journal(backup,receipt)
+            receipt['status']='reconciliation_required';journal(receipt)
             raise Refused('write_outcome_requires_reconciliation') from None
 
 def rollback(profile,backend,backup,check_idle):
@@ -231,8 +315,12 @@ def rollback(profile,backend,backup,check_idle):
     for key in ('before','after'):
         if not isinstance(receipt.get(key),dict) or any(k not in receipt[key] for k in FIELDS):raise Refused('invalid_rollback_receipt')
     if not all(isinstance(receipt['before'].get(k),str) and receipt['before'][k].strip() and receipt['before'][k]==receipt['before'][k].strip() for k in ('provider','model')):raise Refused('unpinned_provider')
-    with _transaction(profile,backend) as native_save:
+    with _transaction(profile,backend) as (native_save, require_valid):
+        def journal(value):
+            require_valid()
+            _journal(backup, value)
         _,rows=_store(profile);current=_target(rows);_idle(current,check_idle)
+        require_valid()
         matches=lambda row:all(k in current and current[k]==row[k] for k in FIELDS)
         reverted=matches(receipt['before'])
         if receipt['status']=='installed' and not matches(receipt['after']):raise Refused('target_drift')
@@ -245,7 +333,7 @@ def rollback(profile,backend,backup,check_idle):
             # fsync failed. Retry only proves the already reversed state;
             # never remove any path that appeared after completed cleanup.
             if any((profile/'scripts'/n).exists() or (profile/'scripts'/n).is_symlink() for n in FILES):raise Refused('installed_file_drift')
-            _fsync_dir(profile/'cron');_fsync_dir(profile/'scripts');_journal(backup,receipt)
+            _fsync_dir(profile/'cron');_fsync_dir(profile/'scripts');journal(receipt)
             return {'status':'rolled_back','job_id':JOB_ID,'target_sha256':digest(current)}
         for name,meta in receipt['files'].items():
             p=profile/'scripts'/name
@@ -256,16 +344,17 @@ def rollback(profile,backend,backup,check_idle):
         if not reverted:
             # Persist intent before any reverse write. A failed native save or
             # receipt publication can then be retried using exact readback.
-            receipt['status']='rollback_started';_journal(backup,receipt)
+            receipt['status']='rollback_started';journal(receipt)
             _update(profile,backend,native_save,rows,expected,updates)
         _fsync_dir(profile/'cron')
-        receipt['status']='job_reverted_files_pending';_journal(backup,receipt)
+        receipt['status']='job_reverted_files_pending';journal(receipt)
         for name,meta in receipt['files'].items():
             p=profile/'scripts'/name
             if not p.exists() and not p.is_symlink():continue
             if hashlib.sha256(_read(p,1024*1024)).hexdigest()!=meta['sha256']:raise Refused('installed_file_drift')
+            require_valid()
             p.unlink()
-        _fsync_dir(profile/'scripts');receipt['status']='rolled_back';_journal(backup,receipt)
+        _fsync_dir(profile/'scripts');receipt['status']='rolled_back';journal(receipt)
         return {'status':'rolled_back','job_id':JOB_ID,'target_sha256':digest(expected)}
 
 
