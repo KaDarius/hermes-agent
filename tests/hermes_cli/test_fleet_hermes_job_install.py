@@ -9,6 +9,8 @@ import fcntl
 import json
 from pathlib import Path
 import tempfile
+import subprocess
+import sys
 import unittest
 from unittest.mock import patch
 from hermes_cli.maintenance import hermes_job_install as sut
@@ -53,6 +55,12 @@ class TransactionTests(unittest.TestCase):
     def apply(self, **kw):
         return sut.apply(self.profile,self.backend,self.expected,self.payloads,self.backup,lambda:None,**kw)
     def rows(self):return json.loads(self.store.read_text(encoding="utf-8"))['jobs']
+    def test_fifo_store_is_refused_without_waiting_for_a_writer(self):
+        self.store.unlink();os.mkfifo(self.store,0o600)
+        code = "from pathlib import Path; import sys; from hermes_cli.maintenance import hermes_job_install as m; exec(\"try:\\n m._store(Path(sys.argv[1]))\\nexcept m.Refused as e:\\n print(str(e))\")"
+        result=subprocess.run([sys.executable,'-B','-c',code,str(self.profile)],cwd=Path(__file__).resolve().parents[2],capture_output=True,text=True,encoding='utf-8',timeout=5)
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(result.stdout.strip(),'unsafe_path')
     def test_nonfinite_peer_number_refused_before_mutation(self):
         raw=json.dumps({'jobs':[self.target,self.other]}).replace('"must survive"','1e999')
         self.store.write_text(raw, encoding="utf-8")

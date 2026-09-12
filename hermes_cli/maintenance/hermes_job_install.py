@@ -51,7 +51,8 @@ def _json(raw):
 
 def _read(path,limit):
     try:
-        fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW)
+        # Validate the opened type without waiting indefinitely on a FIFO.
+        fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
     except OSError:raise Refused('unsafe_path') from None
     with os.fdopen(fd,'rb') as f:
         s=os.fstat(f.fileno())
