@@ -9120,6 +9120,96 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.debug("goal continuation: active-state recheck failed: %s", exc)
             return False
 
+    def _maintenance_is_paused(self) -> bool:
+        return getattr(self, "_maintenance_pause_owner", None) is not None
+
+    async def _wait_maintenance_admission(self) -> None:
+        # Retain queued/internal obligations instead of acknowledging them as
+        # completed. Existing admitted turns do not pass this new-turn gate.
+        while self._maintenance_is_paused():
+            await self._maintenance_pause_event.wait()
+
+    def maintenance_pause(self, request: dict) -> dict:
+        """Pause enrolled native admissions, never stop or interrupt work.
+
+        Called synchronously on the gateway loop. Cron registration uses its
+        own lock; no await separates that latch from message/API admission.
+        This is not external-writer exclusion or a shutdown-ready receipt.
+        """
+        loop = asyncio.get_running_loop()
+        owner = request.get("owner")
+        seconds = request.get("seconds", 60)
+        if (not isinstance(owner, str) or not re.fullmatch(r"[0-9a-f]{32}", owner)
+                or type(seconds) is not int or not 1 <= seconds <= 600):
+            return {"state": "refused", "reason": "invalid_request"}
+        if getattr(self, "_running", False) is not True or getattr(self, "_draining", False):
+            return {"state": "refused", "reason": "lifecycle_transition"}
+        current = getattr(self, "_maintenance_pause_owner", None)
+        if current is not None:
+            return {"state": "paused" if current == owner else "refused",
+                    "reason": "existing_owner", "owner": current}
+        scheduler = sys.modules.get("cron.scheduler")
+        if scheduler is None:
+            return {"state": "refused", "reason": "cron_admission_unavailable"}
+        event = asyncio.Event()
+        timer = loop.call_later(seconds, self._expire_maintenance_pause, owner)
+        try:
+            acquired = scheduler.set_maintenance_pause(owner)
+        except Exception:
+            timer.cancel()
+            return {"state": "refused", "reason": "cron_admission_unavailable"}
+        if not acquired:
+            timer.cancel()
+            return {"state": "refused", "reason": "cron_admission_unavailable"}
+        self._maintenance_pause_owner = owner
+        self._maintenance_pause_event = event
+        self._maintenance_pause_timer = timer
+        result = self.maintenance_status(request)
+        result["seconds"] = seconds
+        return result
+
+    def _expire_maintenance_pause(self, owner: str) -> None:
+        result = self.maintenance_resume({"owner": owner})
+        if result.get("reason") == "cron_admission_unavailable":
+            # Never clear just one half of the latch. Retry bounded lock
+            # acquisition on a later event-loop turn, without blocking it.
+            self._maintenance_pause_timer = asyncio.get_running_loop().call_later(
+                0.1, self._expire_maintenance_pause, owner)
+
+    def maintenance_status(self, request: dict) -> dict:
+        """Report only the owned native latch, never global readiness."""
+        asyncio.get_running_loop()
+        owner = getattr(self, "_maintenance_pause_owner", None)
+        try:
+            count = sys.modules["cron.scheduler"].get_running_admission_count(blocking=False)
+            cron = {"valid": True, "count": count}
+        except Exception:
+            cron = {"valid": False, "count": None}
+        return {"state": "paused" if owner is not None else "running",
+                "owner": owner, "pid": os.getpid(), "cron_admissions": cron,
+                "scope": "native_admissions", "shutdown_ready": False}
+
+    def maintenance_resume(self, request: dict) -> dict:
+        """Release only this request's native pause; preserve other drains."""
+        asyncio.get_running_loop()
+        owner = request.get("owner")
+        if not isinstance(owner, str) or getattr(self, "_maintenance_pause_owner", None) != owner:
+            return {"state": "refused", "reason": "owner_mismatch"}
+        scheduler = sys.modules.get("cron.scheduler")
+        if scheduler is None or not scheduler.set_maintenance_pause(owner, release=True):
+            return {"state": "refused", "reason": "cron_admission_unavailable"}
+        self._maintenance_pause_owner = None
+        self._maintenance_pause_event.set()
+        timer = getattr(self, "_maintenance_pause_timer", None)
+        if timer is not None:
+            timer.cancel()
+        self._maintenance_pause_timer = None
+        deferred = getattr(self, "_maintenance_deferred_resumes", set())
+        self._maintenance_deferred_resumes = set()
+        for platform in deferred:
+            asyncio.get_running_loop().call_soon(self._schedule_resume_pending_sessions, platform)
+        return {"state": "running", "owner": owner, "scope": "native_admissions"}
+
     def _maintenance_counter_snapshot(self) -> dict:
         """Diagnostic counts from this process; NOT drain/admission authority.
 
@@ -9140,10 +9230,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         def cron_count():
             scheduler = sys.modules.get("cron.scheduler")
-            ids = scheduler.get_running_job_ids()
-            if type(ids) is not frozenset or any(type(job_id) is not str or not job_id for job_id in ids):
-                raise ValueError("invalid cron registry")
-            return len(ids)
+            return scheduler.get_running_admission_count()
 
         def api_count():
             adapter = self.adapters.get(Platform.API_SERVER)
@@ -10055,6 +10142,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         source: SessionSource,
     ) -> tuple[Any, Optional[str]]:
         """Claim a cross-process active-session slot for a new gateway turn."""
+        if self._maintenance_is_paused() or getattr(self, "_draining", False):
+            return None, "This agent is paused for maintenance; retry shortly."
         if self._is_session_running(session_key):
             return None, None
         local_limit_message = self._active_session_limit_message(session_key)
@@ -12293,6 +12382,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         agent is already running are skipped regardless, so a session
         scheduled at startup is never resumed a second time.
         """
+        if self._maintenance_is_paused():
+            deferred = getattr(self, "_maintenance_deferred_resumes", None)
+            if deferred is None:
+                deferred = self._maintenance_deferred_resumes = set()
+            deferred.add(platform)
+            return 0
         window = _auto_continue_freshness_window()
         try:
             with self.session_store._lock:  # noqa: SLF001 — snapshot under lock
@@ -18275,6 +18370,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # replays, background-process completions) bypass the gate — they are
         # not user-initiated new work and must still flow during a drain.
         # Reversible: once the marker is removed the gate opens again.
+        await self._wait_maintenance_admission()
         if self._external_drain_active and not is_internal:
             logger.info(
                 "Refusing new turn for session %s — external drain active.",
@@ -31205,7 +31301,11 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     try:
         from gateway.control_socket import GatewayControlServer
 
-        _control_server = GatewayControlServer()
+        _control_server = GatewayControlServer(loop_verb_handlers={
+            "maintenance_pause": runner.maintenance_pause,
+            "maintenance_resume": runner.maintenance_resume,
+            "maintenance_status": runner.maintenance_status,
+        })
         if not await _control_server.start():
             _control_server = None
         else:

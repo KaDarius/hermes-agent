@@ -668,6 +668,42 @@ class _CombinedCancelEvent:
             event.set()
 
 
+# Native process-local admission pause. Completion never waits for its owner.
+_maintenance_pause_owner: Optional[str] = None
+_maintenance_resumed = threading.Event()
+_maintenance_resumed.set()
+_running_admissions: dict = {}
+_running_tick_admissions: dict = {}
+_tick_admission = contextvars.ContextVar("native_tick_admission", default=None)
+
+
+def set_maintenance_pause(owner: str, *, release: bool = False) -> bool:
+    """Change an owner-tagged latch under the actual registration lock.
+
+    Nonblocking acquisition prevents control requests from stalling the event
+    loop. This does not fence external processes or jobs-store writers.
+    """
+    global _maintenance_pause_owner
+    if not isinstance(owner, str) or not re.fullmatch(r"[0-9a-f]{32}", owner):
+        return False
+    if not _running_lock.acquire(blocking=False):
+        return False
+    try:
+        if release:
+            if _maintenance_pause_owner != owner:
+                return False
+            _maintenance_pause_owner = None
+            _maintenance_resumed.set()
+        else:
+            if _maintenance_pause_owner not in (None, owner):
+                return False
+            _maintenance_pause_owner = owner
+            _maintenance_resumed.clear()
+        return True
+    finally:
+        _running_lock.release()
+
+
 def get_running_job_ids() -> "frozenset[str]":
     """Thread-safe snapshot of cron job IDs currently executing.
 
@@ -687,6 +723,20 @@ def get_running_job_ids() -> "frozenset[str]":
         return frozenset(_running_job_ids | _running_fire_owners.keys())
 
 
+def get_running_admission_count(*, blocking: bool = True) -> int:
+    """Strict maintenance count, including a tick before it registers jobs."""
+    if not _running_lock.acquire(blocking=blocking):
+        raise RuntimeError("cron registration busy")
+    try:
+        ids = frozenset(_running_job_ids | _running_fire_owners.keys()
+                       )
+        if any(type(job_id) is not str or not job_id for job_id in ids):
+            raise ValueError("invalid cron registration")
+        return len(ids) + len(_running_tick_admissions)
+    finally:
+        _running_lock.release()
+
+
 def try_register_running_job(job_id: str) -> bool:
     """Atomically add ``job_id`` to the in-flight running set.
 
@@ -703,10 +753,15 @@ def try_register_running_job(job_id: str) -> bool:
     Callers MUST pair a successful registration with
     ``release_running_job`` in a ``finally`` block.
     """
+    profile_home = _get_hermes_home().resolve()
     with _running_lock:
-        if job_id in _running_job_ids:
+        tick_token = _tick_admission.get()
+        admitted_tick = (tick_token is not None
+                         and _running_tick_admissions.get(tick_token) == profile_home)
+        if (_maintenance_pause_owner is not None and not admitted_tick) or job_id in _running_job_ids:
             return False
         _running_job_ids.add(job_id)
+        _running_admissions[job_id] = (object(), profile_home)
         # Claim timestamp + pending-future sentinel are recorded in the SAME
         # critical section as the add, so there is never a window where an
         # id is in-flight without an age the stale sweep can bound it by
@@ -717,10 +772,20 @@ def try_register_running_job(job_id: str) -> bool:
         return True
 
 
+def _running_job_admission(job_id: str):
+    """Capture an opaque issued reservation at the actual registration site."""
+    with _running_lock:
+        admission = _running_admissions.get(job_id)
+        if admission is not None and admission[1] == _get_hermes_home().resolve():
+            return admission[0]
+        return None
+
+
 def release_running_job(job_id: str) -> None:
     """Remove ``job_id`` from the in-flight running set (idempotent)."""
     with _running_lock:
         _running_job_ids.discard(job_id)
+        _running_admissions.pop(job_id, None)
         _running_since.pop(job_id, None)
         _running_futures.pop(job_id, None)
 
@@ -6655,6 +6720,7 @@ def run_one_job(
     verbose: bool = False,
     extra_prompt: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None,
+    _admission_token=None,
 ) -> bool:
     """Run ONE due job end-to-end: execute → save output → deliver → mark.
 
@@ -6679,30 +6745,47 @@ def run_one_job(
     fire_owner = str(claim.get("by") or "") if isinstance(claim, dict) else ""
     execution_token = object()
     profile_home = _get_hermes_home().resolve()
+    # Initial durable-claim validation may itself block. Keep that admitted
+    # attempt visible from before the heartbeat starts until terminal cleanup.
     with _running_lock:
         _running_fire_owners.setdefault(job["id"], {})[execution_token] = (
-            fire_owner or None,
-            profile_home,
+            fire_owner or None, profile_home,
+        )
+    def admitted_run(lost_ownership):
+        cancellation = (_CombinedCancelEvent(lost_ownership, cancel_event)
+                        if cancel_event is not None else lost_ownership)
+        deferred = False
+        while True:
+            if deferred and ((cancellation is not None and cancellation.is_set())
+                    or _is_interrupted(job["id"], execution_token)):
+                if job.get("execution_id"):
+                    finish_execution(job["execution_id"], success=False,
+                                     error="Fire cancelled before native admission resumed.")
+                return True
+            with _running_lock:
+                admission = _running_admissions.get(job["id"])
+                owns_reservation = (_admission_token is not None and admission is not None
+                                    and job["id"] in _running_job_ids
+                                    and admission[0] is _admission_token
+                                    and admission[1] == profile_home)
+                if _maintenance_pause_owner is None or owns_reservation:
+                    if owns_reservation:
+                        _running_admissions.pop(job["id"], None)
+                    break
+            deferred = True
+            # Keep the real durable-claim heartbeat alive while deferred.
+            # No registration/jobs lock is held across this bounded wait.
+            _maintenance_resumed.wait(0.1)
+        return _run_one_job_body(
+            job, adapters=adapters, loop=loop, verbose=verbose,
+            extra_prompt=extra_prompt, fire_claim_lost=cancellation,
+            execution_token=execution_token,
         )
     try:
-        return _run_with_fire_claim_heartbeat(
-            job,
-            lambda lost_ownership: _run_one_job_body(
-                job,
-                adapters=adapters,
-                loop=loop,
-                verbose=verbose,
-                extra_prompt=extra_prompt,
-                fire_claim_lost=(
-                    _CombinedCancelEvent(lost_ownership, cancel_event)
-                    if cancel_event is not None
-                    else lost_ownership
-                ),
-                execution_token=execution_token,
-            ),
-        )
+        return _run_with_fire_claim_heartbeat(job, admitted_run)
     finally:
         with _running_lock:
+            _interrupted_job_ids.discard(execution_token)
             executions = _running_fire_owners.get(job["id"])
             if executions is not None:
                 executions.pop(execution_token, None)
@@ -7247,7 +7330,28 @@ _DEAD_OWNER_REAP_INTERVAL_SECONDS = 300.0
 _last_dead_owner_reap_at: Optional[float] = None
 
 
-def tick(
+def tick(verbose=True, adapters=None, loop=None, sync=True, *, can_dispatch=None):
+    """Admit an entire tick before it claims or advances any due job.
+
+    An admitted batch may finish its already-selected dispatch across a pause;
+    new batches are refused. Its issued job reservations outlive async submit.
+    """
+    profile = _get_hermes_home().resolve()
+    admission = object()
+    with _running_lock:
+        if _maintenance_pause_owner is not None:
+            return 0
+        _running_tick_admissions[admission] = profile
+    token = _tick_admission.set(admission)
+    try:
+        return _tick_body(verbose, adapters, loop, sync, can_dispatch=can_dispatch)
+    finally:
+        _tick_admission.reset(token)
+        with _running_lock:
+            _running_tick_admissions.pop(admission, None)
+
+
+def _tick_body(
     verbose: bool = True,
     adapters=None,
     loop=None,
@@ -7447,7 +7551,7 @@ def tick(
                 _max_workers if _max_workers else "unbounded",
             )
 
-        def _process_job(job: dict) -> bool:
+        def _process_job(job: dict, admission_token=None) -> bool:
             """Run one due job end-to-end. Thin wrapper around the shared
             module-level ``run_one_job`` so ``tick`` and external providers
             (Chronos ``fire_due``) use the identical execute→save→deliver→mark
@@ -7473,6 +7577,7 @@ def tick(
                 adapters=adapters,
                 loop=loop,
                 verbose=verbose,
+                _admission_token=admission_token,
             )
 
         # Partition due jobs: those with a per-job workdir mutate
@@ -7539,6 +7644,7 @@ def tick(
             if not try_register_running_job(job_id):
                 logger.info("Job '%s' already running — skipping", job.get("name", job_id))
                 return None
+            admission_token = _running_job_admission(job_id)
             # Record the attempt before executor dispatch. Recovery classifies
             # abandoned records as unknown; it never automatically retries them.
             try:
@@ -7560,9 +7666,9 @@ def tick(
                 )
                 return None
 
-            def _run_and_release(j=dispatched_job, ctx=_ctx):
+            def _run_and_release(j=dispatched_job, ctx=_ctx, admission=admission_token):
                 try:
-                    return ctx.run(_process_job, j)
+                    return ctx.run(_process_job, j, admission)
                 finally:
                     release_running_job(j["id"])
 
