@@ -1,5 +1,8 @@
+import os
 import pytest
 pytestmark = pytest.mark.macos_only
+if os.name != "posix":
+    pytest.skip("Fleet maintenance adapters require POSIX", allow_module_level=True)
 import contextlib
 import copy
 import fcntl

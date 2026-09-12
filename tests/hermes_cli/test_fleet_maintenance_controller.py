@@ -1,5 +1,8 @@
+import os
 import pytest
 pytestmark = pytest.mark.macos_only
+if os.name != "posix":
+    pytest.skip("Fleet maintenance adapters require POSIX", allow_module_level=True)
 """Isolated state-machine tests. The adapter is an inert cooperating store,
 not proof of a live filesystem CAS or actual gateway/writer exclusion."""
 import contextlib

@@ -1,11 +1,13 @@
+import os
 import pytest
 pytestmark = pytest.mark.macos_only
+if os.name != "posix":
+    pytest.skip("Fleet maintenance adapters require POSIX", allow_module_level=True)
 """Real temporary filesystem and child-process protocol tests; no live profile.
 The explicit fixture callbacks model authority/protocol adoption, not prove it."""
 import copy
 import hashlib
 import json
-import os
 from pathlib import Path
 import subprocess
 import sys
