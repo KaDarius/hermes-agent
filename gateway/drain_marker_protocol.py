@@ -25,7 +25,7 @@ class DrainControlConflict(RuntimeError):
 
 
 def _safe_file(info):
-    if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+    if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()  # windows-footgun: ok — POSIX marker_guard callers only
             or info.st_nlink != 1 or info.st_mode & 0o022):
         raise DrainControlConflict('unsafe_drain_file')
 
@@ -49,7 +49,7 @@ def marker_guard(home: Path):
     try:
         directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         ds = os.fstat(directory)
-        if ds.st_uid != os.getuid() or ds.st_mode & 0o022:
+        if ds.st_uid != os.getuid() or ds.st_mode & 0o022:  # windows-footgun: ok — POSIX guard above
             raise DrainControlConflict('unsafe_drain_directory')
         lockfd = os.open(LOCK, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=directory)
         ls = os.fstat(lockfd)
@@ -64,7 +64,7 @@ def marker_guard(home: Path):
             current_lock = os.stat(LOCK, dir_fd=directory, follow_symlinks=False)
             if _identity(current_root) != _identity(ds) or _identity(current_lock) != _identity(ls):
                 raise DrainControlConflict('drain_protocol_path_changed')
-            if current_root.st_uid != os.getuid() or current_root.st_mode & 0o022:
+            if current_root.st_uid != os.getuid() or current_root.st_mode & 0o022:  # windows-footgun: ok — POSIX guard above
                 raise DrainControlConflict('unsafe_drain_directory')
             _safe_file(current_lock)
 
