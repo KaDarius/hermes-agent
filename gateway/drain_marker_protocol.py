@@ -11,6 +11,7 @@ from contextlib import contextmanager
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import stat
 import uuid
@@ -147,3 +148,76 @@ def describe(found):
     if found is None:
         return {'present': False, 'requested': False, 'sha256': None, 'token': None}
     return {'present': True, 'sha256': hashlib.sha256(found[0]).hexdigest(), 'token': found[1]}
+
+
+def create_owned_marker(home, raw, published, *, require_valid):
+    """Publish exact controller bytes without replacing an existing marker.
+
+    The callback records the generation while the cooperating-writer lock is
+    held. Callback/durability failures preserve the marker for reconciliation.
+    This lock is NOT a dispatcher or lifecycle maintenance capability.
+    """
+    if not isinstance(raw, bytes) or len(raw) > MAX_MARKER or not callable(published):
+        raise DrainControlConflict('invalid_owned_marker')
+    def authority():
+        if not callable(require_valid) or require_valid() is not None:
+            raise DrainControlConflict('invalid_marker_capability')
+    authority()
+    owner = marker_body(raw).get('maintenance_owner')
+    if not isinstance(owner, str) or not re.fullmatch('[0-9a-f]{32}', owner):
+        raise DrainControlConflict('invalid_maintenance_owner')
+    with marker_guard(home) as (fd, check):
+        if read_locked(fd) is not None:
+            raise DrainControlConflict('drain_marker_exists')
+        temporary = '.drain-stage-' + uuid.uuid4().hex
+        opened = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=fd)
+        try:
+            with os.fdopen(opened, 'wb') as stream:
+                stream.write(raw)
+                stream.flush()
+                os.fsync(stream.fileno())
+            check()
+            authority()
+            # link is atomic and fails if MARKER exists; replace would clobber.
+            os.link(temporary, MARKER, src_dir_fd=fd, dst_dir_fd=fd, follow_symlinks=False)
+        finally:
+            os.unlink(temporary, dir_fd=fd)
+        found = read_locked(fd)
+        if found is None or found[0] != raw:
+            raise DrainControlConflict('drain_marker_changed')
+        published(found[1])
+        os.fsync(fd)
+        check()
+        authority()
+
+
+def remove_owned_marker(home, token, sha256, *, require_valid):
+    """Compare generation AND bytes before unlink, under native writer lock."""
+    if (not isinstance(token, str) or not token or not isinstance(sha256, str)
+            or not re.fullmatch('[0-9a-f]{64}', sha256)):
+        raise DrainControlConflict('invalid_marker_identity')
+    def authority():
+        if not callable(require_valid) or require_valid() is not None:
+            raise DrainControlConflict('invalid_marker_capability')
+    authority()
+    with marker_guard(home) as (fd, check):
+        found = read_locked(fd)
+        if found is None:
+            # A previous unlink may have succeeded before fsync failed.
+            # Re-establish durability before acknowledging idempotent cleanup.
+            os.fsync(fd)
+            check()
+            authority()
+            return 'absent'
+        if found[1] != token or hashlib.sha256(found[0]).hexdigest() != sha256:
+            raise DrainControlConflict('drain_marker_replaced')
+        owner = marker_body(found[0]).get('maintenance_owner')
+        if not isinstance(owner, str) or not re.fullmatch('[0-9a-f]{32}', owner):
+            raise DrainControlConflict('invalid_maintenance_owner')
+        check()
+        authority()
+        os.unlink(MARKER, dir_fd=fd)
+        os.fsync(fd)
+        check()
+        authority()
+        return 'removed'
