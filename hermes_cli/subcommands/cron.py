@@ -36,7 +36,11 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     cron_create.add_argument("--name", help="Optional human-friendly job name")
     cron_create.add_argument(
         "--deliver",
-        help="Delivery target: origin, local, telegram, discord, signal, or platform:chat_id",
+        help=(
+            "Delivery target: origin, local, telegram, discord, signal, "
+            "platform:chat_id, or bot-chat[:profile] (inject output into a "
+            "local profile's canonical Bot Chat as a message the bot responds to)"
+        ),
     )
     cron_create.add_argument("--repeat", type=int, help="Optional repeat count")
     cron_create.add_argument(
@@ -105,6 +109,29 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         dest="model_provider",
         help="Inference provider paired with --model (e.g. 'openrouter', 'nous').",
     )
+    cron_create.add_argument(
+        "--reasoning-effort",
+        dest="reasoning_effort",
+        help=(
+            "Pin this job's reasoning (thinking) effort: none, minimal, low, "
+            "medium, high, xhigh, max, or ultra. Overrides agent.reasoning_effort "
+            "and agent.reasoning_overrides for this job; unsupported levels are "
+            "clamped by the provider at request time. Omit to follow config."
+        ),
+    )
+    cron_create.add_argument(
+        "--continuity",
+        dest="continuity",
+        action="store_const",
+        const=True,
+        default=None,
+        help=(
+            "Each run wakes up with the job's own previous output injected "
+            "into its prompt, so it can dedupe against what was already "
+            "reported and continue where the last run left off (scouts, "
+            "monitors, incremental digests). First run is unchanged."
+        ),
+    )
     add_force_file_write_flag(cron_create)
 
     # cron edit
@@ -167,6 +194,27 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         help="Disable no-agent mode on this job (reverts to LLM-driven execution).",
     )
     cron_edit.add_argument(
+        "--continuity",
+        dest="continuity",
+        action="store_const",
+        const=True,
+        default=None,
+        help=(
+            "Turn on run-to-run continuity: each run sees the job's own "
+            "previous output (dedupe, continue where it left off)."
+        ),
+    )
+    cron_edit.add_argument(
+        "--no-continuity",
+        dest="continuity",
+        action="store_const",
+        const=False,
+        help=(
+            "Turn off run-to-run continuity (other context_from job refs "
+            "are preserved)."
+        ),
+    )
+    cron_edit.add_argument(
         "--monitor-script",
         dest="monitor_script",
         help=(
@@ -198,6 +246,15 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         dest="model_provider",
         help="Inference provider paired with --model. Pass empty string to clear.",
     )
+    cron_edit.add_argument(
+        "--reasoning-effort",
+        dest="reasoning_effort",
+        help=(
+            "Pin this job's reasoning (thinking) effort: none, minimal, low, "
+            "medium, high, xhigh, max, or ultra. Pass empty string to clear "
+            "the pin and follow config resolution."
+        ),
+    )
     add_force_file_write_flag(cron_edit)
 
     # lifecycle actions
@@ -207,6 +264,8 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
 
     cron_resume = cron_subparsers.add_parser("resume", help="Resume a paused job")
     cron_resume.add_argument("job_id", help="Job ID to resume")
+    cron_resume.add_argument("--at", dest="run_at", help="Re-arm at an ISO-8601 time")
+    cron_resume.add_argument("--run-now", action="store_true", help="Re-arm to run now")
     add_force_file_write_flag(cron_resume)
 
     cron_run = cron_subparsers.add_parser(
