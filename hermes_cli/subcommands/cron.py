@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Callable
 
-from hermes_cli.subcommands._shared import add_accept_hooks_flag
+from hermes_cli.subcommands._shared import add_accept_hooks_flag, add_force_file_write_flag
 
 
 def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
@@ -132,6 +132,7 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
             "monitors, incremental digests). First run is unchanged."
         ),
     )
+    add_force_file_write_flag(cron_create)
 
     # cron edit
     cron_edit = cron_subparsers.add_parser(
@@ -254,26 +255,31 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
             "the pin and follow config resolution."
         ),
     )
+    add_force_file_write_flag(cron_edit)
 
     # lifecycle actions
     cron_pause = cron_subparsers.add_parser("pause", help="Pause a scheduled job")
     cron_pause.add_argument("job_id", help="Job ID to pause")
+    add_force_file_write_flag(cron_pause)
 
     cron_resume = cron_subparsers.add_parser("resume", help="Resume a paused job")
     cron_resume.add_argument("job_id", help="Job ID to resume")
     cron_resume.add_argument("--at", dest="run_at", help="Re-arm at an ISO-8601 time")
     cron_resume.add_argument("--run-now", action="store_true", help="Re-arm to run now")
+    add_force_file_write_flag(cron_resume)
 
     cron_run = cron_subparsers.add_parser(
         "run", help="Run a job on the next scheduler tick"
     )
     cron_run.add_argument("job_id", help="Job ID to trigger")
     add_accept_hooks_flag(cron_run)
+    add_force_file_write_flag(cron_run)
 
     cron_remove = cron_subparsers.add_parser(
         "remove", aliases=["rm", "delete"], help="Remove a scheduled job"
     )
     cron_remove.add_argument("job_id", help="Job ID to remove")
+    add_force_file_write_flag(cron_remove)
 
     # cron status
     cron_subparsers.add_parser("status", help="Check if cron scheduler is running")

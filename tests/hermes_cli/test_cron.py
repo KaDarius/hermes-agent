@@ -20,6 +20,18 @@ def tmp_cron_dir(tmp_path, monkeypatch):
     return tmp_path
 
 
+@pytest.fixture(autouse=True)
+def _no_live_scheduler_owner(monkeypatch):
+    """Neutralize the KDTSK-1793 live-scheduler-owner guard for every test in
+    this file. The real detector does a live process-table scan, which would
+    spuriously refuse cron mutations here whenever a real Hermes serve/
+    gateway process happens to be running on the host executing the test
+    suite. The guard itself is exercised directly in
+    ``TestLiveSchedulerOwnerGuard`` below, which overrides this patch.
+    """
+    monkeypatch.setattr(cron_cli, "_detect_live_cron_scheduler_owners", lambda: [])
+
+
 class TestCronCommandLifecycle:
 
     def test_edit_persists_user_owned_inference_pins(self, tmp_cron_dir, capsys):
@@ -383,3 +395,141 @@ class TestCronRunBackgroundDispatch:
         assert rc == 0
         assert "Running in background (delegation del-xyz)." in out
         assert "failed" not in out.lower()
+class TestLiveSchedulerOwnerGuard:
+    """KDTSK-1793: a live Hermes ``serve`` (Desktop app backend) or
+    ``gateway run`` process holds cron/job state in memory and periodically
+    flushes it back over ``jobs.json``, silently reverting any CLI mutation
+    that landed between reads. Cron mutations must refuse when the detector
+    reports such an owner, unless ``--force-file-write`` is passed. Read-only
+    subcommands must never be gated.
+    """
+
+    FAKE_OWNERS = [(4242, "python -m hermes_cli.main serve --host 127.0.0.1 --port 0")]
+
+    def test_edit_refused_when_live_scheduler_owns_state(self, tmp_cron_dir, capsys, monkeypatch):
+        job = create_job(prompt="Ping", schedule="every 1h")
+        monkeypatch.setattr(cron_cli, "_detect_live_cron_scheduler_owners", lambda: self.FAKE_OWNERS)
+
+        rc = cron_command(
+            Namespace(
+                cron_command="edit",
+                job_id=job["id"],
+                schedule="every 2h",
+                prompt=None,
+                name=None,
+                deliver=None,
+                repeat=None,
+                skill=None,
+                skills=None,
+                clear_skills=False,
+                add_skills=None,
+                remove_skills=None,
+                script=None,
+                workdir=None,
+                no_agent=None,
+                force_file_write=False,
+            )
+        )
+        out = capsys.readouterr().out
+        assert rc == 1
+        assert "REFUSED" in out
+        assert "pid 4242" in out
+        assert "hermes_cli.main serve" in out
+        # No mutation happened — the schedule is unchanged.
+        assert get_job(job["id"])["schedule_display"] != "every 120m"
+
+    def test_edit_bypasses_guard_with_force_file_write(self, tmp_cron_dir, capsys, monkeypatch):
+        job = create_job(prompt="Ping", schedule="every 1h")
+        monkeypatch.setattr(cron_cli, "_detect_live_cron_scheduler_owners", lambda: self.FAKE_OWNERS)
+
+        rc = cron_command(
+            Namespace(
+                cron_command="edit",
+                job_id=job["id"],
+                schedule="every 2h",
+                prompt=None,
+                name=None,
+                deliver=None,
+                repeat=None,
+                skill=None,
+                skills=None,
+                clear_skills=False,
+                add_skills=None,
+                remove_skills=None,
+                script=None,
+                workdir=None,
+                no_agent=None,
+                force_file_write=True,
+            )
+        )
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "Updated job" in out
+        assert "REFUSED" not in out
+        assert get_job(job["id"])["schedule_display"] == "every 120m"
+
+    def test_create_refused_when_live_scheduler_owns_state(self, tmp_cron_dir, capsys, monkeypatch):
+        monkeypatch.setattr(cron_cli, "_detect_live_cron_scheduler_owners", lambda: self.FAKE_OWNERS)
+
+        rc = cron_command(
+            Namespace(
+                cron_command="create",
+                schedule="every 1h",
+                prompt="Ping",
+                name=None,
+                deliver=None,
+                repeat=None,
+                skill=None,
+                skills=None,
+                script=None,
+                workdir=None,
+                no_agent=False,
+                force_file_write=False,
+            )
+        )
+        out = capsys.readouterr().out
+        assert rc == 1
+        assert "REFUSED" in out
+        assert list_jobs() == []
+
+    def test_pause_refused_when_live_scheduler_owns_state(self, tmp_cron_dir, capsys, monkeypatch):
+        job = create_job(prompt="Ping", schedule="every 1h")
+        monkeypatch.setattr(cron_cli, "_detect_live_cron_scheduler_owners", lambda: self.FAKE_OWNERS)
+
+        rc = cron_command(
+            Namespace(cron_command="pause", job_id=job["id"], force_file_write=False)
+        )
+        out = capsys.readouterr().out
+        assert rc == 1
+        assert "REFUSED" in out
+        assert get_job(job["id"]).get("enabled", True) is True
+
+    def test_remove_bypasses_guard_with_force_file_write(self, tmp_cron_dir, capsys, monkeypatch):
+        job = create_job(prompt="Ping", schedule="every 1h")
+        monkeypatch.setattr(cron_cli, "_detect_live_cron_scheduler_owners", lambda: self.FAKE_OWNERS)
+
+        rc = cron_command(
+            Namespace(cron_command="remove", job_id=job["id"], force_file_write=True)
+        )
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "REFUSED" not in out
+        assert get_job(job["id"]) is None
+
+    def test_readonly_list_unaffected_by_live_scheduler(self, tmp_cron_dir, capsys, monkeypatch):
+        create_job(prompt="Ping", schedule="every 1h")
+        monkeypatch.setattr(cron_cli, "_detect_live_cron_scheduler_owners", lambda: self.FAKE_OWNERS)
+
+        rc = cron_command(Namespace(cron_command="list", all=True))
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "REFUSED" not in out
+
+    def test_readonly_status_unaffected_by_live_scheduler(self, tmp_cron_dir, capsys, monkeypatch):
+        create_job(prompt="Ping", schedule="every 1h")
+        monkeypatch.setattr(cron_cli, "_detect_live_cron_scheduler_owners", lambda: self.FAKE_OWNERS)
+
+        rc = cron_command(Namespace(cron_command="status"))
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "REFUSED" not in out
