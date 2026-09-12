@@ -1066,6 +1066,7 @@ def write_runtime_status(
     exit_reason: Any = _UNSET,
     restart_requested: Any = _UNSET,
     active_agents: Any = _UNSET,
+    maintenance_counters: Any = _UNSET,
     platform: Any = _UNSET,
     platform_state: Any = _UNSET,
     error_code: Any = _UNSET,
@@ -1114,6 +1115,17 @@ def write_runtime_status(
         payload["restart_requested"] = bool(restart_requested)
     if active_agents is not _UNSET:
         payload["active_agents"] = parse_active_agents(active_agents)
+    if maintenance_counters is not _UNSET:
+        # Preserve the sample's own time and writer identity on later writes.
+        # A platform-only update or another process must not refresh an old
+        # sample merely by updating the outer status record. This is additive
+        # diagnostic evidence; it does not assert marker or route ownership.
+        sample = copy.deepcopy(maintenance_counters)
+        sample["writer_pid"] = current_record["pid"]
+        sample["writer_start_time"] = current_record["start_time"]
+        sample["profile"] = current_record["hermes_home"]
+        sample.update(_get_code_identity_fields())
+        payload["maintenance_counters"] = sample
     if served_profiles is not _UNSET:
         # Profiles this gateway multiplexes (multi-profile mode). Absent/empty
         # for a single-profile gateway. Lets `hermes status` show per-profile

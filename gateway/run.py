@@ -9120,14 +9120,64 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.debug("goal continuation: active-state recheck failed: %s", exc)
             return False
 
+    def _maintenance_counter_snapshot(self) -> dict:
+        """Diagnostic counts from this process; NOT drain/admission authority.
+
+        Never import a new scheduler to establish idleness. Absent sources,
+        malformed data and read errors are unknown, not zero. An absent API
+        adapter is unknown until a separate registry/configuration witness
+        proves that API work is disabled. Samples contain no job/session IDs.
+        """
+        from collections.abc import Mapping
+
+        observed_at = time.time()
+
+        def messaging_count():
+            agents = self._running_agents
+            if not isinstance(agents, Mapping):
+                raise ValueError("invalid messaging registry")
+            return len(agents)
+
+        def cron_count():
+            scheduler = sys.modules.get("cron.scheduler")
+            ids = scheduler.get_running_job_ids()
+            if type(ids) is not frozenset or any(type(job_id) is not str or not job_id for job_id in ids):
+                raise ValueError("invalid cron registry")
+            return len(ids)
+
+        def api_count():
+            adapter = self.adapters.get(Platform.API_SERVER)
+            return adapter.active_agent_work_count()
+
+        counters = {}
+        for name, read in (("messaging", messaging_count), ("cron", cron_count), ("api", api_count)):
+            try:
+                count = read()
+                valid = type(count) is int and count >= 0
+            except Exception:
+                count = None
+                valid = False
+            counters[name] = {"valid": valid, "count": count if valid else None}
+        sample = {"observed_at": observed_at, "counters": counters}
+        observation = getattr(self, "_maintenance_drain_observation", None)
+        if isinstance(observation, dict):
+            # This observation has its own age. A counter-only update must
+            # never renew an old marker acknowledgment.
+            sample["drain"] = dict(observation)
+        return sample
+
     def _update_runtime_status(self, gateway_state: Optional[str] = None, exit_reason: Optional[str] = None) -> None:
         try:
+            # Legacy aggregate helpers may import a previously absent cron
+            # registry. Observe diagnostics before those side effects.
+            maintenance_counters = self._maintenance_counter_snapshot()
             from gateway.status import write_runtime_status
             write_runtime_status(
                 gateway_state=gateway_state,
                 exit_reason=exit_reason,
                 restart_requested=self._restart_requested,
                 active_agents=self._active_work_count(),
+                maintenance_counters=maintenance_counters,
             )
         except Exception:
             pass
@@ -9149,8 +9199,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Best-effort: a failed status write must never disrupt a turn.
         """
         try:
+            maintenance_counters = self._maintenance_counter_snapshot()
             from gateway.status import write_runtime_status
-            write_runtime_status(active_agents=self._active_work_count())
+            write_runtime_status(
+                active_agents=self._active_work_count(),
+                maintenance_counters=maintenance_counters,
+            )
         except Exception:
             pass
 
@@ -9208,6 +9262,39 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         self._update_runtime_status("running")
 
+    def _observe_external_drain(self) -> None:
+        """Apply one POSIX marker observation, then publish its evidence.
+
+        An owned fingerprint acknowledges this read and applied state only;
+        it does not establish complete admission/writer exclusion.
+        """
+        from gateway.drain_control import drain_request_snapshot
+
+        observed_at = time.time()
+        previous = getattr(self, "_maintenance_drain_observation", None)
+        was_active = self._external_drain_active
+        try:
+            snapshot = drain_request_snapshot()
+            if snapshot['requested']:
+                self._enter_external_drain()
+            else:
+                self._exit_external_drain()
+            self._maintenance_drain_observation = {
+                **snapshot,
+                'observed_at': observed_at,
+                'valid': self._running is True and self._draining is False
+                         and self._external_drain_active == snapshot['requested'],
+                'gateway_state': 'draining' if self._external_drain_active else 'running',
+            }
+            if snapshot['requested'] or was_active or not previous or not previous.get('valid'):
+                self._persist_active_agents()
+        except Exception:
+            # Preserve current drain state on unreadable/busy input, and
+            # discard any old owned fingerprint from the next status write.
+            self._maintenance_drain_observation = {'valid': False, 'observed_at': observed_at}
+            self._persist_active_agents()
+            raise
+
     async def _drain_control_watcher(self, interval: float = 1.0) -> None:
         """Background task: reconcile gateway accept-state with the drain marker.
 
@@ -9226,7 +9313,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         while self._running:
             try:
-                if drain_requested():
+                if os.name == 'posix':
+                    self._observe_external_drain()
+                elif drain_requested():
                     self._enter_external_drain()
                     # API and cron work live outside messaging's
                     # _running_agents map. Refresh the aggregate while an
