@@ -1279,6 +1279,10 @@ def _reserve_pending_api_work(adapter):
     A handler can detach the reservation to an asyncio task; its done callback
     then owns release so shutdown cannot miss the handoff to background work.
     """
+    if adapter._native_maintenance_paused():
+        reservation = _api_agent_request_reservation.get()
+        if not (reservation and reservation["active"]):
+            raise web.HTTPServiceUnavailable(reason="Native admissions paused")
     reservation = {"active": True, "detached": False}
     adapter._pending_agent_requests += 1
     try:
@@ -1717,9 +1721,16 @@ class APIServerAdapter(BasePlatformAdapter):
         except Exception:
             return False
 
+    def _native_maintenance_paused(self) -> bool:
+        runner = self.gateway_runner
+        if runner is None:
+            from gateway.run import _gateway_runner_ref
+            runner = _gateway_runner_ref()
+        return runner is not None and getattr(runner, "_maintenance_pause_owner", None) is not None
+
     def _draining_response(self) -> Optional["web.Response"]:
         """Return a retryable response while the gateway drains existing work."""
-        if not self._gateway_is_draining():
+        if not self._native_maintenance_paused() and not self._gateway_is_draining():
             return None
         return web.json_response(
             _openai_error(

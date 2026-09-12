@@ -46,7 +46,7 @@ def test_invalid_raw_api_count_stays_unknown(runner, value):
 def test_failed_cron_and_absent_api_are_unknown(runner, monkeypatch):
     import cron.scheduler as scheduler
     def fail(): raise RuntimeError('private fixture error')
-    monkeypatch.setattr(scheduler, 'get_running_job_ids', fail)
+    monkeypatch.setattr(scheduler, 'get_running_admission_count', fail)
     sample = runner._maintenance_counter_snapshot()
     assert sample['counters']['cron'] == {'valid': False, 'count': None}
     assert sample['counters']['api'] == {'valid': False, 'count': None}
