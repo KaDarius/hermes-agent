@@ -27,7 +27,7 @@ def test_real_registry_registration_appears_in_native_sample(runner):
     assert scheduler.try_register_running_job(key)
     try:
         runner._running_agents = {'turn': object()}
-        runner.adapters[Platform.API_SERVER] = SimpleNamespace(active_agent_work_count=lambda: 3)
+        runner.adapters[Platform.API_SERVER] = SimpleNamespace(strict_active_agent_work_count=lambda: 3)
         sample = runner._maintenance_counter_snapshot()
         assert sample['counters']['messaging'] == {'valid': True, 'count': 1}
         assert sample['counters']['cron'] == {'valid': True, 'count': len(scheduler.get_running_job_ids())}
@@ -39,7 +39,7 @@ def test_real_registry_registration_appears_in_native_sample(runner):
 
 @pytest.mark.parametrize('value', [True, -1, 0.5, '0', None])
 def test_invalid_raw_api_count_stays_unknown(runner, value):
-    runner.adapters[Platform.API_SERVER] = SimpleNamespace(active_agent_work_count=lambda: value)
+    runner.adapters[Platform.API_SERVER] = SimpleNamespace(strict_active_agent_work_count=lambda: value)
     assert runner._maintenance_counter_snapshot()['counters']['api'] == {'valid': False, 'count': None}
 
 
@@ -84,3 +84,63 @@ def test_real_status_file_keeps_sample_age_and_original_writer(runner, monkeypat
     assert after['pid'] == 999999
     assert after['maintenance_counters'] == before
     assert after['maintenance_counters']['writer_pid'] != after['pid']
+
+
+@pytest.mark.parametrize('field,value', [
+    ('_pending_agent_requests', True),
+    ('_pending_agent_requests', '0'),
+    ('_inflight_agent_runs', -1),
+    ('_active_run_tasks', None),
+])
+def test_real_api_registry_corruption_is_not_valid_idle(runner, field, value):
+    from gateway.config import PlatformConfig
+    from gateway.platforms.api_server import APIServerAdapter
+    adapter = APIServerAdapter(PlatformConfig(enabled=True))
+    setattr(adapter, field, value)
+    runner.adapters[Platform.API_SERVER] = adapter
+    assert runner._maintenance_counter_snapshot()['counters']['api'] == {'valid': False, 'count': None}
+
+
+@pytest.mark.asyncio
+async def test_real_api_pending_and_task_registries_are_counted(runner):
+    import asyncio
+    from gateway.config import PlatformConfig
+    from gateway.platforms.api_server import APIServerAdapter
+    adapter = APIServerAdapter(PlatformConfig(enabled=True))
+    active = asyncio.get_running_loop().create_future()
+    finished = asyncio.get_running_loop().create_future()
+    finished.set_result(None)
+    adapter._pending_agent_requests = 2
+    adapter._inflight_agent_runs = 3
+    adapter._active_run_tasks = {'active': active, 'finished': finished}
+    runner.adapters[Platform.API_SERVER] = adapter
+    try:
+        assert runner._maintenance_counter_snapshot()['counters']['api'] == {'valid': True, 'count': 6}
+        active.set_result(None)
+        assert runner._maintenance_counter_snapshot()['counters']['api'] == {'valid': True, 'count': 5}
+    finally:
+        active.cancel()
+
+
+@pytest.mark.parametrize('result', [0, None, 'done'])
+def test_invalid_task_completion_state_is_unknown(runner, result):
+    from gateway.config import PlatformConfig
+    from gateway.platforms.api_server import APIServerAdapter
+    adapter = APIServerAdapter(PlatformConfig(enabled=True))
+    adapter._active_run_tasks = {'broken': SimpleNamespace(done=lambda: result)}
+    runner.adapters[Platform.API_SERVER] = adapter
+    assert runner._maintenance_counter_snapshot()['counters']['api'] == {'valid': False, 'count': None}
+
+
+def test_api_registry_read_error_does_not_leak_or_become_idle(runner):
+    from gateway.config import PlatformConfig
+    from gateway.platforms.api_server import APIServerAdapter
+    adapter = APIServerAdapter(PlatformConfig(enabled=True))
+    def fail():
+        raise RuntimeError('private API registry detail')
+    adapter._active_run_tasks = {'broken': SimpleNamespace(done=fail)}
+    runner.adapters[Platform.API_SERVER] = adapter
+    sample = runner._maintenance_counter_snapshot()
+    assert sample['counters']['api'] == {'valid': False, 'count': None}
+    assert 'private API registry detail' not in repr(sample)
+    assert adapter.active_agent_work_count() == 0  # legacy callers unchanged
