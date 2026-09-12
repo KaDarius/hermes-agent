@@ -53,3 +53,13 @@ writers and marker writers still require independent adoption/exclusion.
 `LiveAuthority` remains refusing until that complete authority exists. This
 native pause alone must never be used to authorize a hot source replacement,
 forced shutdown, ledger recovery or fleet activation.
+
+Installer lock validation binds both the fire and jobs locks to the opened
+parent/inode, owner process/thread, and active context. Payload publication,
+native writes, receipt updates and rollback cleanup revalidate the held locks.
+If exclusion is lost after publication, the installer preserves files and the
+last durable receipt. That receipt may still say `prepared`; it is not proof
+that no files were published. Reconciliation requires a fresh verified hold and
+readback; do not delete files or rerun installation based on that label alone.
+These checks detect observed lock replacement and do not replace complete
+cooperating-writer exclusion or provide authority over unenrolled writers.
