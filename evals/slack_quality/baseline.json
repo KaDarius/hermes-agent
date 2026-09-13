@@ -1,0 +1,112 @@
+{
+  "schema_version": 1,
+  "provenance": {
+    "kind": "sanitized measured timestamps and separately reviewed findings",
+    "capture_date": "2026-09-12",
+    "source": "completed coordinator Slack read and bounded Beta SQLite read-only captures",
+    "coverage": "selected observed events only; not a complete provider or delivery trace",
+    "secrets_or_message_bodies_included": false,
+    "provider_calls_captured": false
+  },
+  "requests": {
+    "baseline": {
+      "class": "expanded",
+      "evidence": "HERMES-BASELINE-01; coordinator Slack read plus bounded state.db rows299152/299166",
+      "review_findings": [
+        "invented workdir failed before uptime execution",
+        "home search retrieved historical artifacts",
+        "internal deliberation surfaced",
+        "no completed answer"
+      ],
+      "first_visible_verified": true,
+      "outcome_verified": true,
+      "visibility_complete": false
+    },
+    "delta_followup": {
+      "class": "bounded_fleet",
+      "evidence": "Slack request1789261768.072989",
+      "review_findings": [
+        "DNS failure overgeneralized to network and SSH restrictions",
+        "unverified command suggestion"
+      ],
+      "session_model": "gpt-oss:20b (cumulative; not per-call proof)"
+    },
+    "account_followup": {
+      "class": "bounded_fleet",
+      "evidence": "Slack request1789262205.421149",
+      "review_findings": [
+        "account and hostname confusion"
+      ]
+    },
+    "key_followup": {
+      "class": "expanded",
+      "evidence": "Slack request1789262653.175579; failure1789262955.260569",
+      "review_findings": [
+        "exhausted continuations"
+      ],
+      "outcome_verified": true,
+      "visibility_complete": false
+    }
+  },
+  "events": [
+    {
+      "request_id": "baseline",
+      "kind": "ingress",
+      "at": "1789260814.212429",
+      "source": "slack"
+    },
+    {
+      "request_id": "baseline",
+      "kind": "persisted_user",
+      "at": "1789260814.444566",
+      "source": "database",
+      "row_id": 299152
+    },
+    {
+      "request_id": "baseline",
+      "kind": "tool_record",
+      "at": "1789261160.516308",
+      "source": "database",
+      "row_id": 299166
+    },
+    {
+      "request_id": "baseline",
+      "kind": "progress",
+      "at": "1789261160.771069",
+      "source": "slack",
+      "delivered": true
+    },
+    {
+      "request_id": "baseline",
+      "kind": "failure",
+      "at": "1789261707.737419",
+      "source": "slack",
+      "delivered": true
+    },
+    {
+      "request_id": "delta_followup",
+      "kind": "ingress",
+      "at": "1789261768.072989",
+      "source": "slack"
+    },
+    {
+      "request_id": "account_followup",
+      "kind": "ingress",
+      "at": "1789262205.421149",
+      "source": "slack"
+    },
+    {
+      "request_id": "key_followup",
+      "kind": "ingress",
+      "at": "1789262653.175579",
+      "source": "slack"
+    },
+    {
+      "request_id": "key_followup",
+      "kind": "failure",
+      "at": "1789262955.260569",
+      "source": "slack",
+      "delivered": true
+    }
+  ]
+}
