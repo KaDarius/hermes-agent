@@ -4095,6 +4095,12 @@ def _normalize_empty_agent_response(
             return ""
         if agent_result.get("partial"):
             err = agent_result.get("error", "processing incomplete")
+            if err == "Response remained truncated after 4 continuation attempts":
+                return (
+                    "⚠️ No complete answer was produced: the response remained "
+                    "truncated after 4 continuation attempts. The request is "
+                    "incomplete. Break it into smaller questions before retrying."
+                )
             return f"⚠️ Processing stopped: {str(err)[:200]}. Try again."
         return (
             "⚠️ Processing completed but no response was generated. "
