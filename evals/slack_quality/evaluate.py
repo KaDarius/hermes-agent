@@ -2,8 +2,9 @@
 from __future__ import annotations
 
 import argparse
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, localcontext
 import json
+import re
 from pathlib import Path
 
 
@@ -13,6 +14,8 @@ OUTCOME_TARGETS = {'simple': Decimal(60), 'bounded_fleet': Decimal(180)}
 def _time(value):
     if not isinstance(value, str):
         raise ValueError('Timestamps must be decimal strings, not binary floats')
+    if not re.fullmatch(r'[0-9]{1,20}(?:\.[0-9]{1,80})?', value):
+        raise ValueError('Timestamp requires 1-20 integer digits and at most 80 fractional digits')
     try:
         result = Decimal(value)
     except InvalidOperation as exc:
@@ -30,6 +33,13 @@ def _metric(value, target):
 
 
 def evaluate(data, request_id):
+    # Accepted timestamps have at most 100 digits; subtraction remains exact.
+    with localcontext() as context:
+        context.prec = 128
+        return _evaluate(data, request_id)
+
+
+def _evaluate(data, request_id):
     request = data['requests'][request_id]
     complete = request.get('visibility_complete') is True
     receipt_known = complete or request.get('first_visible_verified') is True
@@ -56,13 +66,13 @@ def evaluate(data, request_id):
     calls = []
     telemetry = [e for e in events if e['source'] == 'provider_telemetry'
                  and e['kind'] in {'provider_start', 'provider_end'}]
-    for call_id in sorted({e.get('call_id') for e in telemetry if isinstance(e.get('call_id'), str)}):
+    for call_id in sorted({e.get('call_id') for e in telemetry if isinstance(e.get('call_id'), str) and e['call_id'].strip()}):
         starts = [e for e in telemetry if e.get('call_id') == call_id and e['kind'] == 'provider_start']
         ends = [e for e in telemetry if e.get('call_id') == call_id and e['kind'] == 'provider_end']
         if len(starts) != 1 or len(ends) != 1:
             continue
         a, b = starts[0], ends[0]
-        if any(not isinstance(a.get(k), str) or not a[k] or a[k] != b.get(k) for k in ('model', 'provider')):
+        if any(not isinstance(a.get(k), str) or not a[k].strip() or a[k] != b.get(k) for k in ('model', 'provider')):
             continue
         if b['time'] < a['time']:
             raise ValueError('Provider call ends before it starts')

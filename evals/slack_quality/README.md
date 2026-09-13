@@ -13,7 +13,7 @@ Accepted **offline targets**: visible receipt within 5s, simple local outcome wi
 
 Evidence rules:
 
-- Timestamps are finite decimal strings. Events from another request never contribute to the requested result.
+- Timestamps are nonnegative decimal strings with 1–20 integer digits and up to 80 fractional digits; exponent notation is rejected. Arithmetic uses sufficient isolated precision to preserve every accepted digit. Events from another request never contribute to the requested result.
 - Only successful Slack delivery observations count as visible output. Database assistant text and unsuccessful sends do not.
 - `visibility_complete: true` asserts a reviewed complete visible-event trace. Without it, progress cadence and single-outcome success cannot be established. Selected observations can establish first-receipt/outcome timing only with separately reviewed `first_visible_verified`/`outcome_verified` flags. Duplicate observed outcomes still prove duplication.
 - Provider durations require one start/end pair with the same request, call ID, provider and model. Matched pairs never imply every call was captured. Session-level model metadata supplies no attribution.

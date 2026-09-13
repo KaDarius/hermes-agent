@@ -112,3 +112,22 @@ def test_selected_events_cannot_prove_progress_gaps_or_unique_outcome():
     assert report['single_outcome'] == 'UNKNOWN'
     assert report['receipt']['status'] == 'UNKNOWN'
     assert report['outcome']['status'] == 'UNKNOWN'
+
+
+@pytest.mark.parametrize('call_id', ['', '   '])
+def test_empty_call_identity_never_establishes_attribution(call_id):
+    data = case([event('ingress', '100'),
+                 event('provider_start', '101', source='provider_telemetry', call_id=call_id, provider='p', model='m'),
+                 event('provider_end', '104', source='provider_telemetry', call_id=call_id, provider='p', model='m')])
+    assert evaluate(data, 'one')['provider_attribution'] == 'UNKNOWN'
+
+
+def test_high_precision_above_boundary_cannot_round_to_pass():
+    report = evaluate(case([event('ingress', '100'),
+                            event('progress', '105.00000000000000000000000000001', delivered=True)]), 'one')
+    assert report['receipt']['status'] == 'FAIL'
+
+
+def test_extreme_exponent_timestamp_rejected():
+    with pytest.raises(ValueError):
+        evaluate(case([event('ingress', '1e999999999')]), 'one')
