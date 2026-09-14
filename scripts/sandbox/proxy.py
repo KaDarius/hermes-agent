@@ -19,6 +19,7 @@ Usage: proxy.py <fixture-root> <certs-dir> <real-ca-bundle>
 
 import os
 import pathlib
+import select
 import socket
 import ssl
 import subprocess
@@ -168,10 +169,34 @@ def forward_http(conn, host, port, request, target):
         relay(upstream, conn)
 
 
+def tunnel(client, host, port):
+    """Bidirectional raw TCP tunnel for upstream hosts with no local fixtures."""
+    try:
+        with socket.create_connection((host, port), timeout=UPSTREAM_TIMEOUT_SECONDS) as upstream:
+            client.sendall(b'HTTP/1.1 200 Connection Established\r\n\r\n')
+            sockets = [client, upstream]
+            while True:
+                readable, _, exceptional = select.select(sockets, [], sockets, 60)
+                if exceptional or not readable:
+                    break
+                for s in readable:
+                    data = s.recv(MAX_REQUEST_BYTES)
+                    if not data:
+                        return
+                    other = upstream if s is client else client
+                    other.sendall(data)
+    except (OSError, socket.error):
+        return
+
+
 def handle_connect(conn, target):
-    """Intercept a CONNECT tunnel, terminating TLS with a minted cert."""
+    """Intercept a CONNECT tunnel with a minted cert if fixtures exist; otherwise tunnel transparently."""
     host, _, port_text = target.rpartition(':')
     port = int(port_text or '443')
+    if not (ROOT / host).is_dir():
+        tunnel(conn, host, port)
+        return
+
     conn.sendall(b'HTTP/1.1 200 Connection Established\r\n\r\n')
     cert, key = cert_for(host)
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
