@@ -1016,6 +1016,73 @@ class TestRunJobSessionPersistence:
         assert os.getenv("HERMES_CRON_AUTO_DELIVER_THREAD_ID") is None
         assert fake_db.close.call_count == 2
 
+    def test_run_job_delivers_partial_response_on_length_continuation_ceiling(self, tmp_path):
+        """KDTSK-2713: a length-continuation-ceiling result (completed=False,
+        partial=True, a stitched final_response, no turn_exit_reason) must be
+        delivered as a caveated response, not raised and discarded.
+
+        Regression for jira-reorg-skill-edits-apply (Hermes job 10a24bc9bbfe),
+        which failed with a bare "RuntimeError: Response remained truncated
+        after 4 continuation attempts" on 2026-07-13/14, 2026-09-13, and
+        2026-09-15 while the stitched partial text it recovered was silently
+        thrown away.
+        """
+        job = {
+            "id": "ceiling-job",
+            "name": "ceiling-test",
+            "prompt": "write me a long report",
+        }
+        with self._run_job_patches(tmp_path) as (fake_db, mock_agent_cls):
+            mock_agent = mock_agent_cls.return_value
+            mock_agent.run_conversation.return_value = {
+                "final_response": "part one part two part three part four.",
+                "messages": [],
+                "api_calls": 4,
+                "completed": False,
+                "partial": True,
+                "error": "Response remained truncated after 4 continuation attempts",
+            }
+            success, output, final_response, error = run_job(job)
+
+        assert success is True, (
+            "a recovered stitched partial response must be delivered, not raised"
+        )
+        assert error is None
+        assert "part one part two part three part four." in final_response
+        assert "truncated after 4 continuation attempts" in final_response, (
+            "the delivered text must carry a caveat naming the truncation, not "
+            "present partial content as if it were complete"
+        )
+        assert "## Response" in output
+        assert "## Error" not in output
+
+    def test_run_job_still_fails_on_unrelated_partial_true_shape(self, tmp_path):
+        """The length-continuation carve-out must stay narrowly scoped.
+
+        A different partial=True shape (e.g. a broken tool-call/stream state)
+        must keep failing loudly — this is not a blanket 'partial=True means
+        deliver' change.
+        """
+        job = {
+            "id": "broken-tool-call-job",
+            "name": "broken-tool-call-test",
+            "prompt": "do something with a tool",
+        }
+        with self._run_job_patches(tmp_path) as (fake_db, mock_agent_cls):
+            mock_agent = mock_agent_cls.return_value
+            mock_agent.run_conversation.return_value = {
+                "final_response": "half a tool call",
+                "messages": [],
+                "completed": False,
+                "partial": True,
+                "error": "Codex response remained incomplete after 3 continuation attempts",
+            }
+            success, output, final_response, error = run_job(job)
+
+        assert success is False
+        assert "Codex response remained incomplete after 3 continuation attempts" in error
+        assert "## Error" in output
+
 
 class TestRunJobConfigLogging:
     """Verify that config.yaml parse failures are logged, not silently swallowed."""

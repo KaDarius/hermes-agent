@@ -6255,7 +6255,29 @@ def run_job(
             and turn_exit_reason.startswith("max_iterations_reached(")
             and bool(final_response_text)
         )
-        if result.get("failed") is True or (result.get("completed") is False and not max_iteration_summary):
+        # KDTSK-2713: the length-continuation ceiling in conversation_loop.py
+        # (agent/conversation_loop.py, the 4th-consecutive-truncation return) sets
+        # completed=False, partial=True, and a stitched final_response — but it
+        # never sets turn_exit_reason, so it could never match max_iteration_summary
+        # above even though it deliberately produced a usable partial answer. That
+        # made this branch raise and silently discard final_response_text right
+        # after computing it. Narrowly scoped to this exact error shape (not every
+        # partial=True result — several other sites return partial=True for a
+        # genuinely broken tool-call/stream state that should keep failing loudly).
+        _err_str = str(result.get("error") or "")
+        length_continuation_partial = (
+            result.get("failed") is not True
+            and result.get("completed") is False
+            and result.get("partial") is True
+            and _err_str.startswith("Response remained truncated after")
+            and "continuation attempt" in _err_str
+            and bool(final_response_text)
+        )
+        if result.get("failed") is True or (
+            result.get("completed") is False
+            and not max_iteration_summary
+            and not length_continuation_partial
+        ):
             _err_text = (
                 result.get("error")
                 or final_response_text
@@ -6268,6 +6290,17 @@ def run_job(
                 "delivering the response instead of failing the cron run",
                 job_name,
             )
+        if length_continuation_partial:
+            logger.warning(
+                "Job '%s' hit the length-continuation ceiling (%s) but produced a "
+                "stitched partial response; delivering the partial response instead "
+                "of failing the cron run",
+                job_name,
+                _err_str,
+            )
+            result = dict(result)
+            _caveat = f"⚠️ Partial response — {_err_str}.\n\n"
+            result["final_response"] = _caveat + final_response_text
 
         final_response = result.get("final_response", "") or ""
         # Strip leaked placeholder text that upstream may inject on empty completions.
