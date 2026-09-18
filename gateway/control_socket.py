@@ -238,6 +238,7 @@ class GatewayControlServer:
         home: Optional[Path] = None,
         *,
         verb_handlers: Optional[dict[str, Callable[[], dict[str, Any]]]] = None,
+        loop_verb_handlers: Optional[dict[str, Callable[[dict], dict]]] = None,
     ) -> None:
         if home is None:
             from gateway.status import _get_process_hermes_home
@@ -254,6 +255,7 @@ class GatewayControlServer:
         }
         if verb_handlers:
             self._handlers.update(verb_handlers)
+        self._loop_handlers = dict(loop_verb_handlers or {})
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -382,6 +384,48 @@ class GatewayControlServer:
             encoded = b'{"ok": false, "error": "response too large"}'
         return encoded + b"\n"
 
+    def _is_loop_request(self, raw: bytes) -> bool:
+        try:
+            request = json.loads(raw)
+            return isinstance(request, dict) and request.get("verb") in self._loop_handlers
+        except (ValueError, TypeError):
+            return False
+
+    def handle_loop_request_line(self, raw: bytes) -> bytes:
+        """Run only explicitly enrolled bounded handlers on the owning loop.
+
+        Mutating requests require a strict version/id envelope. Observer
+        handlers retain their executor behavior and cannot invoke these verbs.
+        """
+        request_id = None
+        try:
+            asyncio.get_running_loop()
+            def unique(pairs):
+                result = {}
+                for key, value in pairs:
+                    if key in result:
+                        raise ValueError("duplicate field")
+                    result[key] = value
+                return result
+            request = json.loads(raw, object_pairs_hook=unique)
+            if not isinstance(request, dict):
+                raise ValueError("invalid request")
+            request_id = request.get("id")
+            if (type(request.get("protocol")) is not int
+                    or request["protocol"] != CONTROL_PROTOCOL_VERSION
+                    or type(request_id) is not int):
+                raise ValueError("invalid envelope")
+            handler = self._loop_handlers[request["verb"]]
+            response = {"ok": True, "protocol": CONTROL_PROTOCOL_VERSION,
+                        "id": request_id, "result": handler(request)}
+        except Exception:
+            response = {"ok": False, "protocol": CONTROL_PROTOCOL_VERSION,
+                        "id": request_id, "error": "invalid native control request"}
+        encoded = json.dumps(response).encode("utf-8")
+        if len(encoded) > _MAX_RESPONSE_BYTES:
+            return b'{"ok": false, "error": "response too large"}\n'
+        return encoded + b"\n"
+
     async def _handle_connection(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
@@ -395,9 +439,12 @@ class GatewayControlServer:
             # gateway's event loop (the same loop drives every platform
             # adapter), so a fast-polling consumer can't stall heartbeats.
             loop = asyncio.get_running_loop()
-            response = await loop.run_in_executor(
-                None, self.handle_request_line, raw.rstrip(b"\n")
-            )
+            if self._is_loop_request(raw):
+                response = self.handle_loop_request_line(raw.rstrip(b"\n"))
+            else:
+                response = await loop.run_in_executor(
+                    None, self.handle_request_line, raw.rstrip(b"\n")
+                )
             writer.write(response)
             await writer.drain()
         except (asyncio.TimeoutError, ConnectionError, OSError):
@@ -428,7 +475,10 @@ class _PipeControlProtocol(asyncio.Protocol):
         if b"\n" in self._buffer:
             line, _, _ = bytes(self._buffer).partition(b"\n")
             try:
-                self._transport.write(self._server.handle_request_line(line))
+                response = (self._server.handle_loop_request_line(line)
+                            if self._server._is_loop_request(line)
+                            else self._server.handle_request_line(line))
+                self._transport.write(response)
             finally:
                 self._transport.close()
 

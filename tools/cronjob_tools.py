@@ -784,6 +784,7 @@ def _run_claimed_job(
     try:
         from cron.scheduler import (
             release_running_job,
+            _running_job_admission,
             run_one_job,
             try_register_running_job,
         )
@@ -805,6 +806,7 @@ def _run_claimed_job(
                 ),
             }
         _registered = True
+        admission_token = _running_job_admission(job_id)
 
         claim = job.get("fire_claim")
         fire_owner = str(claim.get("by") or "") if isinstance(claim, dict) else None
@@ -890,6 +892,7 @@ def _run_claimed_job(
                 processed = run_one_job(
                     job, adapters=adapters, loop=gateway_loop,
                     extra_prompt=extra_prompt,
+                    _admission_token=admission_token,
                 )
             finally:
                 _heartbeat_stop.set()

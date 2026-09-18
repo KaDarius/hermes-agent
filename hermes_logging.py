@@ -65,6 +65,31 @@ if sys.platform == "win32":
     from concurrent_log_handler import (  # noqa: E402
         ConcurrentRotatingFileHandler as RotatingFileHandler,
     )
+elif sys.platform == "darwin":  # HERMES-CLH-DARWIN KDTSK-2024
+    # Darwin gets the same cross-process rotation lock as Windows: multiple
+    # Hermes processes (launchd gateway + desktop serve) hold agent.log for
+    # append, and stdlib doRollover() cascade-deletes files another process
+    # is still counting on -- silent record loss, no error (POSIX rename
+    # succeeds, which is why this is invisible where WinError 32 was loud).
+    # Fail-OPEN: if concurrent-log-handler is missing OR broken in the venv
+    # (e.g. a hermes update rebuilt the venv and dropped it -- it is win32-only
+    # in the vendor pyproject.toml, so this IS the expected steady state after
+    # a Darwin uv sync, not a rare edge case), fall back to stdlib rather than
+    # crash the gateway at import. Broad `except Exception`, not just
+    # `except ImportError`: a partially-installed or corrupted package on disk
+    # can raise SyntaxError/OSError/RuntimeError out of the import statement
+    # itself, not only ModuleNotFoundError -- and the documented contract here
+    # is "must not crash the gateway at import", full stop, not "must not crash
+    # it for exactly one reason machine-readable as ImportError". The guard
+    # healer alerts on -- and re-installs to recover from -- that state
+    # separately; see hermes_guard_self_heal.py's check_logging_clh_parity()
+    # and repair_logging_clh_parity() (KDTSK-2024).
+    try:
+        from concurrent_log_handler import (  # noqa: E402
+            ConcurrentRotatingFileHandler as RotatingFileHandler,
+        )
+    except Exception:
+        from logging.handlers import RotatingFileHandler  # noqa: E402
 else:
     from logging.handlers import RotatingFileHandler  # noqa: E402
 
@@ -132,8 +157,11 @@ def _is_windows_concurrent_log_lock_timeout(exc: BaseException | None) -> bool:
     long it raises this RuntimeError. Logging failures should not escape into
     Desktop chat output.
     """
+    # HERMES-CLH-SUPPRESSOR-DARWIN: darwin runs concurrent-log-handler since KDTSK-2024;
+    # its lock-timeout RuntimeError is reachable there when flock() itself raises
+    # (EINTR/EBADF/unsupported fs) 20x -- NOT under mere contention, which blocks.
     return (
-        sys.platform == "win32"
+        sys.platform in ("win32", "darwin")
         and isinstance(exc, RuntimeError)
         and _CONCURRENT_LOG_LOCK_TIMEOUT in str(exc)
     )

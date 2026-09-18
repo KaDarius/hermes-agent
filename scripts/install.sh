@@ -2414,6 +2414,11 @@ install_node_deps() {
         return 0
     fi
 
+    if [ "$SKIP_BROWSER" = true ]; then
+        log_info "Skipping Node.js dependencies (--skip-browser)"
+        return 0
+    fi
+
     if [ -f "$INSTALL_DIR/package.json" ]; then
         log_info "Installing Node.js dependencies (browser tools)..."
         cd "$INSTALL_DIR"

@@ -18,7 +18,8 @@ Contract (presence-based, mirroring ``.restart_notify.json``):
   * begin-drain  → write ``{HERMES_HOME}/.drain_request.json`` with
     ``{"action": "drain", "requested_at": <iso>, "principal": <str>,
     "epoch": <instantiation-epoch>, "suppress_notification": <bool>}``.
-  * cancel-drain → remove the marker.
+  * cancel-drain → remove an ordinary marker. POSIX writers serialize through
+    ``.drain-control.lock`` and refuse a marker containing ``maintenance_owner``.
   * The gateway watcher treats **presence of a marker stamped with the current
     instantiation epoch** as "external drain active": flip
     ``gateway_state -> "draining"`` and stop accepting new turns. Absence (or a
@@ -66,12 +67,14 @@ from __future__ import annotations
 import functools
 import json
 import logging
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
 from hermes_constants import get_hermes_home
 from utils import atomic_json_write
+from gateway.drain_marker_protocol import DrainControlConflict
 
 _log = logging.getLogger(__name__)
 
@@ -196,16 +199,48 @@ def write_drain_request(
         "epoch": current_instantiation_epoch(),
         "suppress_notification": bool(suppress_notification),
     }
-    atomic_json_write(drain_request_path(home), payload)
+    if os.name == 'posix':
+        from gateway.drain_marker_protocol import marker_guard, read_locked, require_unreserved, replace_locked
+        # Match atomic_json_write's existing new-profile behavior.
+        try:
+            drain_request_path(home).parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            raise DrainControlConflict('drain_home_unavailable') from None
+        with marker_guard(drain_request_path(home).parent) as (fd, check):
+            require_unreserved(read_locked(fd))
+            replace_locked(fd, payload, check)
+    else:
+        # Preserve the legacy Windows path; POSIX protocol adoption must not
+        # be claimed for a Windows writer until equivalent support is tested.
+        atomic_json_write(drain_request_path(home), payload)
     return payload
 
 
 def clear_drain_request(*, home: Optional[Path] = None) -> bool:
     """Remove the drain marker (cancel-drain). Returns True if one existed.
 
-    Best-effort: a missing file is not an error (cancel is idempotent).
+    A missing file is not an error (cancel is idempotent). POSIX callers raise
+    DrainControlConflict for busy/unsafe/maintenance-owned or corrupt markers.
+    Only the owning maintenance transaction may clean up its reserved marker.
     """
     path = drain_request_path(home)
+    if os.name == 'posix':
+        from gateway.drain_marker_protocol import MARKER, marker_guard, read_locked, require_unreserved
+        try:
+            path.parent.stat()
+        except FileNotFoundError:
+            return False
+        except OSError:
+            raise DrainControlConflict('drain_home_unavailable') from None
+        with marker_guard(path.parent) as (fd, check):
+            found = read_locked(fd)
+            require_unreserved(found)
+            check()
+            if found is not None:
+                os.unlink(MARKER, dir_fd=fd)
+            # An absent retry may follow a successful unlink whose sync failed.
+            os.fsync(fd)
+            return found is not None
     try:
         path.unlink()
         return True
@@ -214,6 +249,28 @@ def clear_drain_request(*, home: Optional[Path] = None) -> bool:
     except OSError as e:
         _log.warning("drain-control: failed to remove %s: %s", path, e)
         return False
+
+
+def drain_request_snapshot(*, home: Optional[Path] = None) -> dict[str, Any]:
+    """POSIX marker observation from one stable read; not admission authority.
+
+    Unlike the legacy best-effort reader, unsafe/unreadable/busy observations
+    raise a conflict, never report absence. Corrupt payloads still request a
+    drain, preserving the legacy presence policy, but cannot be overwritten
+    or cleared by ordinary callers because ownership is unknown.
+    """
+    from gateway.drain_marker_protocol import marker_guard, read_locked, marker_body, describe
+    with marker_guard(drain_request_path(home).parent) as (fd, check):
+        found = read_locked(fd)
+        result = describe(found)
+        if found is not None:
+            try:
+                body = marker_body(found[0])
+            except DrainControlConflict:
+                body = {}
+            result['requested'] = not _marker_is_stale(body)
+        check()
+        return result
 
 
 def _marker_epoch_is_stale(body: dict[str, Any]) -> bool:
@@ -356,6 +413,23 @@ def read_drain_request(*, home: Optional[Path] = None) -> Optional[dict[str, Any
     rather than an exception). Never raises.
     """
     path = drain_request_path(home)
+    if os.name == 'posix':
+        from gateway.drain_marker_protocol import marker_guard, read_locked, marker_body
+        try:
+            path.parent.stat()
+        except FileNotFoundError:
+            return None
+        except OSError:
+            return {}
+        try:
+            with marker_guard(path.parent) as (fd, check):
+                found = read_locked(fd)
+                check()
+                return None if found is None else marker_body(found[0])
+        except DrainControlConflict:
+            # Unknown is not confirmed absence. Preserve the legacy
+            # presence-based fail-safe without blocking on special files.
+            return {}
     try:
         raw = path.read_text(encoding="utf-8")
     except FileNotFoundError:

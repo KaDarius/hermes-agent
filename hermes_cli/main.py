@@ -5386,7 +5386,13 @@ def cmd_cron(args):
     """Cron job management."""
     from hermes_cli.cron import cron_command
 
-    cron_command(args)
+    # Propagate the return code so `main()`'s dispatch (which does
+    # `rc = args.func(args); if isinstance(rc, int) and rc != 0: sys.exit(rc)`)
+    # actually exits non-zero on failure/refusal — e.g. the KDTSK-1793
+    # live-scheduler-owner guard in cron_edit/cron_create/_job_action.
+    # Previously this call's return value was discarded, so every cron
+    # subcommand exited 0 even on a reported failure.
+    return cron_command(args)
 
 
 def cmd_sync(args):

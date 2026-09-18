@@ -90,6 +90,34 @@ class TestPermissionDenied:
         assert "Permission denied" in hint
 
 
+class TestWorkingDirectoryFailure:
+    def test_executable_permission_failure_keeps_permission_guidance(self):
+        hint = annotate_failure("./run.sh", 126, "bash: line 1: ./run.sh: Permission denied")
+        assert "Permission denied" in hint
+        assert "workdir" not in hint
+
+    @pytest.mark.parametrize("reason", ["No such file or directory", "Not a directory", "Permission denied"])
+    def test_cd_failure_does_not_prescribe_executable_permissions(self, reason):
+        hint = annotate_failure("uptime", 126, f"/bin/bash: line 2: cd: /Users/cgate: {reason}")
+        assert "workdir" in hint
+        assert "chmod" not in hint
+
+    def test_real_shell_missing_directory(self, tmp_path):
+        import subprocess
+        import shlex
+
+        missing = tmp_path / "absent cwd"
+        result = subprocess.run(
+            ["bash", "-c", f"builtin cd -- {shlex.quote(str(missing))} || exit 126\nprintf command-ran"],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 126
+        assert "command-ran" not in result.stdout
+        hint = annotate_failure("uptime", result.returncode, result.stderr)
+        assert "workdir" in hint
+        assert "chmod" not in hint
+
+
 class TestBoundedScan:
     def test_pattern_beyond_scan_window_ignored(self):
         out = "x" * 5000 + "\npython: command not found"

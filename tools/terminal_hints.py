@@ -115,6 +115,22 @@ def _hint_gh_rate_limit(command: str, output: str) -> Optional[str]:
     )
 
 
+def _hint_working_directory(command: str, output: str) -> Optional[str]:
+    # The shell wrapper also uses exit 126 when its startup cd fails.
+    # That is not evidence that the requested executable needs chmod.
+    if not re.search(
+        r"^(?:/[^\n:]+/)?(?:bash|sh): (?:line \d+: )?cd: .+: "
+        r"(?:No such file or directory|Not a directory|Permission denied)\s*$",
+        output, re.M,
+    ):
+        return None
+    return (
+        "The shell could not enter the requested directory. Verify the workdir "
+        "exists and is accessible on this execution backend; use a verified "
+        "directory before retrying."
+    )
+
+
 def _hint_permission_denied(command: str, output: str) -> Optional[str]:
     if "Permission denied" not in output and "EACCES" not in output:
         return None
@@ -133,6 +149,7 @@ _OUTPUT_HINTS: list[Callable[[str, str], Optional[str]]] = [
     _hint_module_not_found,
     _hint_already_exists,
     _hint_gh_rate_limit,
+    _hint_working_directory,
     _hint_permission_denied,
 ]
 

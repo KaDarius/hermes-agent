@@ -373,6 +373,13 @@ def _run_agent(
     from run_agent import AIAgent
 
     cfg = load_config()
+    agent_cfg = cfg.get("agent") or {}
+    if not isinstance(agent_cfg, dict):
+        agent_cfg = {}
+    ephemeral_system_prompt = (
+        os.getenv("HERMES_EPHEMERAL_SYSTEM_PROMPT", "")
+        or str(agent_cfg.get("system_prompt") or "")
+    ).strip()
 
     # Resolve effective model: explicit arg → env var → config.
     model_cfg = cfg.get("model") or {}
@@ -460,6 +467,9 @@ def _run_agent(
     )
 
     skills_prompt = _build_preloaded_skills_prompt(skills)
+    ephemeral_system_prompt = "\n\n".join(
+        part for part in (ephemeral_system_prompt, skills_prompt) if part
+    ) or None
 
     session_db = _create_session_db_for_oneshot()
     # The try spans agent construction (not just ``chat``) so the SQLite store
@@ -486,7 +496,7 @@ def _run_agent(
             session_db=session_db,
             credential_pool=runtime.get("credential_pool"),
             fallback_model=_fb or None,
-            ephemeral_system_prompt=skills_prompt,
+            ephemeral_system_prompt=ephemeral_system_prompt,
             # Interactive callbacks are intentionally NOT wired beyond this
             # one.  In oneshot mode there's no user sitting at a terminal:
             #   - clarify  → returns a synthetic "pick a default" instruction

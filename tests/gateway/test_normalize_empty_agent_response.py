@@ -13,6 +13,24 @@ import pytest
 from gateway.run import _normalize_empty_agent_response
 
 
+def test_exhausted_truncation_recommends_narrower_scope_not_unchanged_retry():
+    result = {"partial": True, "completed": False, "api_calls": 7,
+              "error": "Response remained truncated after 4 continuation attempts"}
+    response = _normalize_empty_agent_response(result, "", history_len=10)
+    assert "no complete answer" in response.lower()
+    assert "smaller" in response.lower()
+    assert "try again" not in response.lower()
+    assert "/reset" not in response
+    assert len(response) < 400
+    assert result["completed"] is False
+
+
+def test_truncation_does_not_replace_available_partial_text():
+    result = {"partial": True, "completed": False, "api_calls": 7,
+              "error": "Response remained truncated after 4 continuation attempts"}
+    assert _normalize_empty_agent_response(result, "Verified host: Beta", history_len=10) == "Verified host: Beta"
+
+
 class TestPersistenceFailureRecoveryMessage:
     """Failed turns whose failure_reason marks a session-persistence
     failure get a dedicated recovery message: reassure the user their

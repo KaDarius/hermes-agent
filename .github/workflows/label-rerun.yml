@@ -37,8 +37,28 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           set -uo pipefail
+
+          require_current_head() {
+            local current_head
+            current_head=$(gh pr view "$PR_NUMBER" --repo "$REPO" \
+              --json headRefOid --jq '.headRefOid') || {
+              echo "Could not verify the current PR head; refusing to rerun."
+              exit 1
+            }
+            if [ -z "$current_head" ]; then
+              echo "Empty PR head; refusing to rerun."
+              exit 1
+            fi
+            if [ "$current_head" != "$HEAD_SHA" ]; then
+              echo "PR head changed since this label event; nothing to rerun."
+              exit 0
+            fi
+          }
+
+          require_current_head
 
           # Find the latest CI run for this PR's head SHA.
           RUN_INFO=$(gh run list \
@@ -82,6 +102,9 @@ jobs:
             fi
           fi
 
+          # A long wait may outlive the revision that received the label.
+          # Rerunning that old revision can cancel the current PR's CI.
+          require_current_head
           echo "Run completed. Rerunning all failed jobs..."
           gh run rerun "$RUN_ID" --repo "$REPO" --failed || true
           echo "Done. GitHub will rerun review-labels and all dependent jobs."
