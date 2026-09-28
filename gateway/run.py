@@ -6893,7 +6893,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._busy_input_modes_by_profile: Dict[str, str] = {}
         self._busy_text_modes_by_profile: Dict[str, str] = {}
         self._restart_drain_timeout = self._load_restart_drain_timeout()
-        self._restart_after_turn_timeout = self._load_restart_after_turn_timeout()
+        self._restart_after_turn_timeout, self._restart_budget_source = self._load_restart_after_turn_setting()
         self._cron_drain_timeout = self._load_cron_drain_timeout()
         self._provider_routing = self._load_provider_routing()
         self._fallback_model = self._load_fallback_model()
@@ -9924,26 +9924,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     @staticmethod
     def _load_restart_after_turn_timeout() -> float:
-        """Load in-band restart wait-for-idle timeout in seconds (#77184)."""
+        return GatewayRunner._load_restart_after_turn_setting()[0]
+
+    @staticmethod
+    def _load_restart_after_turn_setting() -> tuple[float, str]:
+        """Load validated budget and its observed runtime source."""
         env_raw = os.getenv("HERMES_RESTART_AFTER_TURN_TIMEOUT")
         if env_raw is not None and str(env_raw).strip() != "":
             raw: object = env_raw
+            source = "runtime_environment"
         else:
             cfg = _load_gateway_runtime_config()
             raw = cfg_get(cfg, "agent", "restart_after_turn_timeout", default=None)
-        value = parse_restart_after_turn_timeout(raw)
-        # Warn only when the user supplied a non-empty value that failed to
-        # parse (parser falls back to the default). ``0`` is valid.
-        if raw is not None and str(raw).strip() != "":
-            try:
-                float(raw)
-            except (TypeError, ValueError):
-                logger.warning(
-                    "Invalid restart_after_turn_timeout '%s', using default %.0fs",
-                    raw,
-                    DEFAULT_GATEWAY_RESTART_AFTER_TURN_TIMEOUT,
-                )
-        return value
+            source = "config" if raw is not None and str(raw).strip() else "default"
+        return parse_restart_after_turn_timeout(raw), source
 
     @staticmethod
     def _load_cron_drain_timeout() -> float:
@@ -11614,16 +11608,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             pass
 
-    async def _launch_detached_restart_command(self) -> None:
+    async def _launch_detached_restart_command(self) -> bool:
         import shutil
         import subprocess
 
         hermes_cmd = _resolve_hermes_bin()
         if not hermes_cmd:
             logger.error("Could not locate hermes binary for detached /restart")
-            return
+            return False
         if self._detached_restart_helper_started:
-            return
+            return False
         self._detached_restart_helper_started = True
 
         current_pid = os.getpid()
@@ -11682,6 +11676,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if not _alive(pid):
                         break
                     time.sleep(0.2)
+                if _alive(pid):
+                    sys.exit(1)  # Deadline is a refusal, never restart authority.
                 subprocess.Popen(
                     cmd,
                     stdout=subprocess.DEVNULL,
@@ -11767,12 +11763,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         error_field,
                         error_code,
                     )
-            return
+                    return False
+            return True
 
         cmd = " ".join(shlex.quote(part) for part in hermes_cmd)
         shell_cmd = (
             f"deadline=$(( $(date +%s) + {int(restart_after_s)} )); "
             f"while kill -0 {current_pid} 2>/dev/null && [ $(date +%s) -lt $deadline ]; do sleep 0.2; done; "
+            f"if kill -0 {current_pid} 2>/dev/null; then exit 1; fi; "
             f"{cmd} gateway restart"
         )
         # Same marker scrub as the Windows watcher above: this watcher runs
@@ -11800,6 +11798,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 env=watcher_env,
                 start_new_session=True,
             )
+        return True
 
     def _wedged_agent_count(self) -> int:
         """Count running chat agents already past the inactivity timeout.
@@ -11845,142 +11844,198 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Active work minus wedged turns — what the restart wait waits on."""
         return max(0, self._active_work_count() - self._wedged_agent_count())
 
-    async def _await_active_work_before_restart(self) -> bool:
-        """Wait for in-flight work to finish before entering ``stop()``.
+    def _restart_work_count(self) -> int:
+        """Strict restart-only evidence; failed counters never mean idle."""
+        from collections.abc import Mapping
+        scheduler = sys.modules.get("cron.scheduler")
+        if scheduler is None:
+            raise ValueError("unknown cron work")
 
-        In-band restart used to call ``stop()`` immediately, which folded the
-        requesting turn into the drain wait set and force-interrupted it at
-        ``restart_drain_timeout`` (#77184). Instead we refuse new turns and
-        wait here for active agents/cron/api work to reach zero, then let
-        ``stop()`` run against an idle gateway (drain is instant).
+        if not isinstance(self._running_agents, Mapping):
+            raise ValueError("unknown messaging work")
+        counts = [len(self._running_agents), scheduler.get_running_admission_count(blocking=False)]
+        adapter = self.adapters.get(Platform.API_SERVER)
+        if adapter is not None:
+            counts.append(adapter.strict_active_agent_work_count())
+        else:
+            configured = self.config.platforms.get(Platform.API_SERVER)
+            if configured is not None and configured.enabled is not False:
+                raise ValueError("unknown api work")
+        if any(type(n) is not int or n < 0 for n in counts):
+            raise ValueError("unknown work count")
+        return sum(counts)
 
-        Turns already past the inactivity timeout are excluded from the wait
-        (``_wedged_agent_count``): restart is usually the *remedy* for a
-        wedged turn, so deferring it behind one inverts the point of the
-        graceful path. ``stop()``'s drain interrupts them under
-        ``restart_drain_timeout`` instead.
+    def _restart_hold_reason(self, attempt_id: str) -> str:
+        """Read-only eligibility; never releases another owner's hold."""
+        if getattr(self, "_restart_attempt_id", None) != attempt_id:
+            return "stale_attempt"
+        if self._running is not True or self._stop_task is not None:
+            return "shutdown_in_progress"
+        if self._external_drain_active is not False or self._maintenance_is_paused():
+            return "other_hold"
+        # Presence is conservative here, including expired/unknown ownership.
+        # The owned marker protocol fails closed on unreadable/busy paths.
+        from gateway.drain_control import drain_request_snapshot
+        if os.name == "posix":
+            snapshot = drain_request_snapshot(home=_hermes_home)
+            if snapshot.get("present") is not False:
+                return "external_marker"
+        else:
+            # No POSIX ownership protocol on Windows. Confirm absence only;
+            # present/unreadable markers never authorize recovery or restart.
+            from gateway.drain_control import drain_request_path
+            try:
+                drain_request_path(_hermes_home).lstat()
+            except FileNotFoundError:
+                pass
+            else:
+                return "external_marker"
+        return ""
 
-        Returns True when work drained to zero, False when the safety cap
-        elapsed with work still active — or when only wedged work remains —
-        (caller proceeds to ``stop()``, which may then interrupt remaining
-        runs under ``restart_drain_timeout``).
-        """
-        active = self._active_work_count()
-        if active <= 0:
-            return True
-
-        awaitable = self._awaitable_work_count()
-        if awaitable <= 0:
-            logger.warning(
-                "Restart requested with %d active work unit(s), all wedged "
-                "past the inactivity timeout; skipping the after-turn wait "
-                "and proceeding to stop()/drain which will interrupt them",
-                active,
-            )
-            return False
-
-        timeout = float(getattr(self, "_restart_after_turn_timeout", 0.0) or 0.0)
-        if timeout <= 0:
-            logger.info(
-                "Restart requested with %d active work unit(s); "
-                "restart_after_turn_timeout=0 — entering stop()/drain immediately",
-                active,
-            )
-            return False
-
-        logger.info(
-            "Restart requested with %d active work unit(s); "
-            "deferring stop() until they finish (cap=%.0fs) so in-flight "
-            "turns are not amputated (#77184)",
-            active,
-            timeout,
-        )
+    def _record_restart_attempt(self, receipt: dict) -> bool:
+        """Bounded structured facts only: no exceptions, routing IDs or bodies."""
+        current = getattr(self, "_restart_attempt_id", None) == receipt["attempt_id"]
+        if current:
+            self._restart_attempt_receipt = dict(receipt)
         try:
-            self._update_runtime_status("draining")
+            atomic_json_write(
+                _hermes_home / "logs" / "restart_attempts" / (receipt["attempt_id"] + ".json"),
+                receipt,
+            )
+            logger.info("Restart attempt: %s", json.dumps(receipt, sort_keys=True))
+            return True
         except Exception:
-            pass
+            # Logging failure cannot become permission to restart. Keep a
+            # bounded in-memory receipt even if both durable sinks fail.
+            if current:
+                self._restart_attempt_receipt["diagnostic_write"] = "failed"
+            return False
 
+    async def _await_active_work_before_restart(self) -> bool:
+        """Wait for observed idle; a failed/unknown drain NEVER authorizes stop."""
+        timeout = parse_restart_after_turn_timeout(self._restart_after_turn_timeout)
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
-        last_status_at = 0.0
-        while self._awaitable_work_count() > 0:
-            now = loop.time()
-            if now >= deadline:
-                logger.warning(
-                    "Restart after-turn wait timed out after %.0fs with %d "
-                    "still active; proceeding to stop()/drain which may "
-                    "interrupt remaining work (#77184)",
-                    timeout,
-                    self._active_work_count(),
-                )
+        while True:
+            active = self._restart_work_count()
+            self._restart_remaining_work = active
+            if active == 0:
+                self._restart_drain_reason = "idle"
+                return True
+            if self._wedged_agent_count() >= active:
+                self._restart_drain_reason = "wedged_work"
                 return False
-            if (now - last_status_at) >= 30.0:
-                logger.info(
-                    "Restart deferred: waiting on %d active work unit(s) "
-                    "(%d wedged and excluded; %.0fs remaining before force drain)",
-                    self._awaitable_work_count(),
-                    self._wedged_agent_count(),
-                    deadline - now,
-                )
-                try:
-                    self._update_runtime_status("draining")
-                except Exception:
-                    pass
-                last_status_at = now
-            await asyncio.sleep(0.1)
+            if loop.time() >= deadline:
+                self._restart_drain_reason = "timeout"
+                return False
+            await asyncio.sleep(min(0.1, max(0, deadline - loop.time())))
 
-        if self._active_work_count() > 0:
-            logger.warning(
-                "Restart deferred wait: %d wedged work unit(s) remain; "
-                "proceeding to stop()/drain which will interrupt them",
-                self._active_work_count(),
-            )
+    def request_restart(self, *, detached: bool = False, via_service: bool = False,
+                        attempt_id: Optional[str] = None) -> bool:
+        import uuid
+
+        attempt_id = attempt_id or uuid.uuid4().hex
+        if not isinstance(attempt_id, str) or not re.fullmatch(r"[0-9a-f]{32}", attempt_id):
+            raise ValueError("invalid restart attempt identifier")
+        def reject(reason):
+            self._record_restart_attempt({
+                "attempt_id": attempt_id, "started_at": time.time(), "finished_at": time.time(),
+                "basis": "observed", "root_cause": "unverified", "outcome": "refused",
+                "reason": reason, "budget_seconds": None, "budget_source": "unverified",
+                "recovery": "not_needed", "recovery_refusal": None,
+            })
+        if (self._restart_task_started or self._draining
+                or self._running is not True or self._stop_task is not None):
+            reject("existing_lifecycle_transition")
             return False
-
-        logger.info(
-            "Restart deferred wait complete — active work drained; "
-            "proceeding to stop()"
-        )
-        return True
-
-    def request_restart(self, *, detached: bool = False, via_service: bool = False) -> bool:
-        if self._restart_task_started:
-            return False
+        # Validate before changing admission, even if a caller bypassed config loading.
+        try:
+            budget = parse_restart_after_turn_timeout(self._restart_after_turn_timeout)
+        except ValueError:
+            reject("invalid_timeout")
+            raise
+        self._restart_attempt_id = attempt_id
         self._restart_requested = True
         self._restart_detached = detached
         self._restart_via_service = via_service
         self._restart_task_started = True
-        # Refuse new turns immediately while in-flight work finishes.
-        # Keep ``_running`` True so adapters stay connected and the active
-        # turn can still deliver its final response (#77184).
         self._draining = True
+        self._restart_drain_reason = "unknown"
+        self._restart_remaining_work = None
+        receipt = {"attempt_id": attempt_id, "started_at": time.time(),
+                   "budget_seconds": budget,
+                   "budget_source": getattr(self, "_restart_budget_source", "runtime_value"),
+                   "basis": "observed", "root_cause": "unverified",
+                   "outcome": "waiting", "recovery": "not_attempted"}
+        self._record_restart_attempt(receipt)
 
         async def _run_restart() -> None:
-            await self._await_active_work_before_restart()
-            # Launch the detached helper only AFTER the after-turn wait.
-            # Its deadline is drain_timeout+5 and covers stop() teardown —
-            # launching earlier would fire `hermes gateway restart` while
-            # the requesting turn was still running.
-            if detached:
-                try:
-                    await self._launch_detached_restart_command()
-                except Exception as e:
-                    logger.error("Failed to launch detached gateway restart helper: %s", e)
-            await asyncio.sleep(0.05)
-            await self.stop(restart=True, detached_restart=detached, service_restart=via_service)
+            reason = "unknown"
+            transition_started = False
+            helper_attempted = False
+            transition_finished = False
+            try:
+                drained = await self._await_active_work_before_restart()
+                reason = self._restart_drain_reason
+                hold = self._restart_hold_reason(attempt_id)
+                if drained is True and not hold and self._restart_work_count() == 0:
+                    receipt.update(outcome="transition_pending", reason="observed_idle",
+                                   finished_at=time.time(), remaining_work=0)
+                    if not self._record_restart_attempt(receipt):
+                        reason = "diagnostic_failure"
+                    else:
+                        if detached:
+                            helper_attempted = True
+                            if await self._launch_detached_restart_command() is not True:
+                                raise RuntimeError("helper launch unverified")
+                            if self._restart_hold_reason(attempt_id):
+                                raise RuntimeError("hold changed after helper launch")
+                        transition_started = True
+                        await self.stop(restart=True, detached_restart=detached,
+                                        service_restart=via_service)
+                        # Only a completed stop may authorize the next process's
+                        # success notification. Failure to persist leaves the
+                        # earlier nonpositive transition_pending record intact.
+                        receipt.update(outcome="restart_ready", finished_at=time.time())
+                        self._record_restart_attempt(receipt)
+                        transition_finished = True
+                        return
+                elif hold:
+                    reason = hold
+                elif drained is True:
+                    reason = "work_arrived"
+            except asyncio.CancelledError:
+                reason = "cancelled"
+                raise
+            except Exception:
+                reason = "transition_error" if transition_started else "drain_error"
+            finally:
+                # No automatic restart retry. No await separates the in-process
+                # ownership check from restoring our intake flag.
+                if not transition_finished:
+                    try:
+                        hold = self._restart_hold_reason(attempt_id)
+                    except Exception:
+                        hold = "hold_state_unknown"
+                    if transition_started:
+                        hold = "stop_attempted"
+                    elif helper_attempted:
+                        hold = "helper_launch_attempted"
+                    recovery = "held"
+                    if not hold:
+                        self._draining = False
+                        self._restart_requested = False
+                        self._restart_task_started = False
+                        self._restart_detached = False
+                        self._restart_via_service = False
+                        self._restart_command_source = None
+                        recovery = "intake_restored"
+                    receipt.update(outcome="refused", reason=reason,
+                                   recovery=recovery, recovery_refusal=hold or None,
+                                   finished_at=time.time(),
+                                   remaining_work=self._restart_remaining_work)
+                    self._record_restart_attempt(receipt)
 
-        # _run_restart is a short-lived self-terminating task (calls stop()
-        # then returns).  Don't add it to _background_tasks — _stop_impl
-        # cancels all entries in that set, which would cancel _run_restart
-        # while it's awaiting _stop_task, propagating CancelledError into
-        # _stop_impl and preventing _shutdown_event.set() / _exit_code = 75.
-        # See #12875.
-        #
-        # We still hold a strong reference in self._restart_task: a bare
-        # asyncio.create_task() keeps only a weak reference, so the event
-        # loop may garbage-collect a still-pending task mid-flight.  The
-        # cancel loop in _stop_impl explicitly skips _restart_task for the
-        # same reason it skips _stop_task.
         self._restart_task = asyncio.create_task(_run_restart())
         return True
 
@@ -24596,8 +24651,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not notify_path.exists():
             return None
 
+        # Atomically claim one marker before any await. Cleanup belongs to
+        # this private path, never a newer command's shared marker.
+        import uuid
+        claimed_path = notify_path.with_name(".restart_notify." + uuid.uuid4().hex + ".claimed.json")
         try:
-            data = json.loads(notify_path.read_text(encoding="utf-8"))
+            os.replace(notify_path, claimed_path)
+        except FileNotFoundError:
+            return None
+
+        try:
+            data = json.loads(claimed_path.read_text(encoding="utf-8"))
+            attempt_id = data.get("restart_attempt_id")
+            if attempt_id is not None:
+                # New markers require positive evidence this attempt entered
+                # restart, not merely an unrelated process startup afterward.
+                if not isinstance(attempt_id, str) or not re.fullmatch(r"[0-9a-f]{32}", attempt_id):
+                    return None
+                receipt = json.loads((_hermes_home / "logs" / "restart_attempts" /
+                                      (attempt_id + ".json")).read_text(encoding="utf-8"))
+                if receipt.get("attempt_id") != attempt_id or receipt.get("outcome") != "restart_ready":
+                    return None
             platform_str = data.get("platform")
             chat_id = data.get("chat_id")
             chat_type = data.get("chat_type")
@@ -24667,7 +24741,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.warning("Restart notification failed: %s", e)
             return None
         finally:
-            notify_path.unlink(missing_ok=True)
+            claimed_path.unlink(missing_ok=True)
 
     async def _send_home_channel_startup_notifications(
         self,

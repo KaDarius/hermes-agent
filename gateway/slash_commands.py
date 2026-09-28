@@ -1600,6 +1600,20 @@ class GatewaySlashCommandsMixin:
         )
 
     async def _handle_restart_command(self, event: MessageEvent) -> Union[str, EphemeralReply]:
+        # Reserve before marker-write awaits. A second command must not replace
+        # notification ownership while the first command is being scheduled.
+        import uuid
+        if getattr(self, "_restart_command_pending", None):
+            return EphemeralReply(t("gateway.restart.in_progress"))
+        attempt_id = uuid.uuid4().hex
+        self._restart_command_pending = attempt_id
+        try:
+            return await self._handle_reserved_restart_command(event)
+        finally:
+            if self._restart_command_pending == attempt_id:
+                self._restart_command_pending = None
+
+    async def _handle_reserved_restart_command(self, event: MessageEvent) -> Union[str, EphemeralReply]:
         """Handle /restart command - drain active work, then restart the gateway."""
         from gateway.run import _hermes_home
         # Defensive idempotency check: if the previous gateway process
@@ -1632,6 +1646,7 @@ class GatewaySlashCommandsMixin:
         # notify them once it comes back online.
         try:
             notify_data = {
+                "restart_attempt_id": self._restart_command_pending,
                 "platform": event.source.platform.value if event.source.platform else None,
                 "chat_id": event.source.chat_id,
                 "chat_type": event.source.chat_type,
@@ -1704,9 +1719,11 @@ class GatewaySlashCommandsMixin:
         _under_service = is_gateway_supervisor_process()
         _in_container = is_container_restart_context()
         if _under_service or _in_container:
-            self.request_restart(detached=False, via_service=True)
+            accepted = self.request_restart(detached=False, via_service=True, attempt_id=self._restart_command_pending)
         else:
-            self.request_restart(detached=True, via_service=False)
+            accepted = self.request_restart(detached=True, via_service=False, attempt_id=self._restart_command_pending)
+        if not accepted:
+            return "Restart refused; inspect gateway restart-attempt diagnostics."
         if active_agents:
             return t("gateway.draining", count=active_agents)
         return EphemeralReply(t("gateway.restart.restarting"))
