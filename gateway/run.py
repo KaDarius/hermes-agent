@@ -24669,7 +24669,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if not isinstance(attempt_id, str) or not re.fullmatch(r"[0-9a-f]{32}", attempt_id):
                     return None
                 receipt = json.loads((_hermes_home / "logs" / "restart_attempts" /
-                                      (attempt_id + ".json")).read_text())
+                                      (attempt_id + ".json")).read_text(encoding="utf-8"))
                 if receipt.get("attempt_id") != attempt_id or receipt.get("outcome") != "restart_ready":
                     return None
             platform_str = data.get("platform")

@@ -11,6 +11,8 @@ Tests are parametrized over platforms via the ``platform`` fixture in conftest.
 """
 
 import asyncio
+import json
+import uuid
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -94,11 +96,12 @@ class TestSlashCommands:
         assert "verbose" in response_text.lower() or "tool_progress" in response_text
 
     @pytest.mark.asyncio
-    async def test_plaintext_restart_gateway_routes_to_safe_restart_command(self, adapter, runner, platform, monkeypatch):
+    async def test_plaintext_restart_gateway_routes_to_safe_restart_command(self, adapter, runner, platform, monkeypatch, tmp_path):
         if platform != Platform.TELEGRAM:
             pytest.skip("Plaintext restart shortcut is intentionally DM/Telegram-focused")
 
         monkeypatch.setenv("INVOCATION_ID", "e2e-systemd")
+        monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
         runner.request_restart = MagicMock(return_value=True)
 
         send = await send_and_capture(adapter, "restart gateway", platform)
@@ -106,7 +109,12 @@ class TestSlashCommands:
         send.assert_called_once()
         response_text = send.call_args[1].get("content") or send.call_args[0][1]
         assert "restart" in response_text.lower() or "draining" in response_text.lower()
-        runner.request_restart.assert_called_once_with(detached=False, via_service=True)
+        marker = json.loads((tmp_path / ".restart_notify.json").read_text(encoding="utf-8"))
+        attempt_id = marker["restart_attempt_id"]
+        assert uuid.UUID(attempt_id).hex == attempt_id
+        runner.request_restart.assert_called_once_with(
+            detached=False, via_service=True, attempt_id=attempt_id,
+        )
 
     @pytest.mark.asyncio
     async def test_plaintext_restart_gateway_in_group_stays_plain_text(self, adapter, runner, platform, monkeypatch):
