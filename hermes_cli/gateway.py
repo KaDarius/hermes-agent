@@ -4211,8 +4211,9 @@ def systemd_restart(system: bool = False):
         else:
             print(
                 f"⚠ Graceful restart did not complete within {int(wait_budget)}s; "
-                "forcing a service restart..."
+                "leaving the running service untouched; inspect restart-attempt diagnostics."
             )
+            return
 
         _run_systemctl(
             ["reset-failed", svc],
