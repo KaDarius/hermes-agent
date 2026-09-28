@@ -14,6 +14,12 @@ state preserves the pause. Recovery is evaluated once; it does not retry the
 restart, replay queued work, or release another owner's hold. A later explicit
 restart is a new attempt. Wedged work is not permission to interrupt it.
 
+A restart requested while platform connections are still starting is refused
+with `existing_lifecycle_transition`; it does not stop startup or schedule a
+retry. Wait for startup to finish before making a new explicit restart request.
+A stuck startup needs a separately reviewed operator procedure: this change
+does not introduce a startup-abort mechanism.
+
 The systemd graceful-wait timeout leaves the running service untouched.
 Detached helpers refuse to run their restart command if the original process
 still exists when their deadline expires. This is not a guarantee that all

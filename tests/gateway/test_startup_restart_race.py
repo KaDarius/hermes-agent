@@ -1,4 +1,5 @@
 import asyncio
+import json
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -130,41 +131,48 @@ def patch_startup_side_effects(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_startup_aborts_when_restart_begins_during_platform_connect(tmp_path, monkeypatch):
+async def test_startup_refuses_restart_during_platform_connect(tmp_path, monkeypatch):
     patch_startup_side_effects(monkeypatch, tmp_path)
 
     runner = make_startup_runner(tmp_path)
-    first_disconnected = asyncio.Event()
+    second_connect_started = asyncio.Event()
+    hold_connect = asyncio.Event()
+    restart_results = []
+    runner.stop = AsyncMock()
+    runner._launch_detached_restart_command = MagicMock()
     telegram = StartupRaceAdapter(
         Platform.TELEGRAM,
-        on_connect=lambda: runner.request_restart(detached=False, via_service=True),
+        on_connect=lambda: restart_results.append(
+            runner.request_restart(detached=False, via_service=True)
+        ),
     )
-    slack = StartupRaceAdapter(Platform.SLACK, wait_for_disconnect=first_disconnected)
-
-    async def disconnect_and_release():
-        telegram.disconnected = True
-        first_disconnected.set()
-
-    telegram.disconnect = disconnect_and_release
+    slack = StartupRaceAdapter(
+        Platform.SLACK, on_connect=second_connect_started.set,
+        wait_for_disconnect=hold_connect,
+    )
     runner._create_adapter = MagicMock(side_effect=[telegram, slack])
 
-    result = await asyncio.wait_for(runner.start(), timeout=30)
-
-    assert result is True
-    assert telegram.disconnected is True
-    assert telegram.background_cancelled is True
-    assert slack.connected is False
-    assert runner._running is False
-    assert runner.adapters == {}
-    assert runner._update_runtime_status.call_args_list[-1].args[0] == "stopped"
-    assert not any(
-        call.args[:1] == ("running",)
-        for call in runner._update_runtime_status.call_args_list
-    )
-    assert not any(
-        call.args[:2] == (Platform.SLACK.value, "connected")
-        for call in runner._update_platform_runtime_status.call_args_list
-    )
+    start_task = asyncio.create_task(runner.start())
+    try:
+        await asyncio.wait_for(second_connect_started.wait(), timeout=5)
+        assert restart_results == [False]
+        assert telegram.connected is True
+        assert telegram.disconnected is False
+        assert telegram.background_cancelled is False
+        assert runner._restart_requested is False
+        assert runner._restart_task_started is False
+        assert runner._draining is False
+        runner.stop.assert_not_called()
+        runner._launch_detached_restart_command.assert_not_called()
+        receipts = list((tmp_path / "logs" / "restart_attempts").glob("*.json"))
+        assert len(receipts) == 1
+        receipt = json.loads(receipts[0].read_text(encoding="utf-8"))
+        assert receipt["outcome"] == "refused"
+        assert receipt["reason"] == "existing_lifecycle_transition"
+    finally:
+        # Cancel only this synthetic startup task, held at a fake adapter.
+        start_task.cancel()
+        await asyncio.gather(start_task, return_exceptions=True)
 
 
 @pytest.mark.asyncio
