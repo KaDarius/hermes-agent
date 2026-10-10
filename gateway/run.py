@@ -2704,6 +2704,7 @@ from gateway.restart import (
     DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
     GATEWAY_FATAL_CONFIG_EXIT_CODE,
     GATEWAY_SERVICE_RESTART_EXIT_CODE,
+    InvalidRestartTimeout,
     parse_cron_drain_timeout,
     parse_restart_after_turn_timeout,
     parse_restart_drain_timeout,
@@ -15360,7 +15361,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _phase_elapsed(),
                 )
 
-            if self._restart_requested and self._restart_detached:
+            if (self._restart_requested and self._restart_detached
+                    and not self._detached_restart_helper_started):
                 try:
                     await self._launch_detached_restart_command()
                 except Exception as e:
@@ -31202,7 +31204,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
 
     try:
         runner = GatewayRunner(config)
-    except ValueError:
+    except InvalidRestartTimeout:
         logger.error("Invalid gateway configuration; startup refused. Check restart timeout settings.")
         return False
     # ``--replace`` is explicit startup authority, not a durable reconnect

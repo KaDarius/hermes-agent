@@ -94,18 +94,22 @@ def parse_restart_drain_timeout(raw: object) -> float:
     return max(0.0, value)
 
 
+class InvalidRestartTimeout(ValueError):
+    """Invalid after-turn budget, distinguishable at startup boundaries."""
+
+
 def parse_restart_after_turn_timeout(raw: object) -> float:
     """Preserve valid explicit budgets; reject invalid input before lifecycle work."""
     if raw is None or (isinstance(raw, str) and not raw.strip()):
         return DEFAULT_GATEWAY_RESTART_AFTER_TURN_TIMEOUT
     if isinstance(raw, bool):
-        raise ValueError("invalid restart after-turn timeout")
+        raise InvalidRestartTimeout("invalid restart after-turn timeout")
     try:
         value = float(raw)
     except (TypeError, ValueError, OverflowError):
-        raise ValueError("invalid restart after-turn timeout") from None
+        raise InvalidRestartTimeout("invalid restart after-turn timeout") from None
     if not math.isfinite(value) or value < 0:
-        raise ValueError("invalid restart after-turn timeout")
+        raise InvalidRestartTimeout("invalid restart after-turn timeout")
     return value
 
 

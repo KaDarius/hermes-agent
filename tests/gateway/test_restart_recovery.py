@@ -366,7 +366,8 @@ async def test_invalid_budget_chat_returns_refusal(runner):
 
 
 @pytest.mark.asyncio
-async def test_real_stop_settles_receipt_before_shutdown_waiter_returns(runner, monkeypatch, tmp_path):
+@pytest.mark.parametrize('detached', [False, True])
+async def test_real_stop_settles_receipt_before_shutdown_waiter_returns(runner, monkeypatch, tmp_path, detached):
     from unittest.mock import Mock
     runner._running_agents.clear()
     runner.stop = gateway_run.GatewayRunner.stop.__get__(runner)
@@ -378,12 +379,20 @@ async def test_real_stop_settles_receipt_before_shutdown_waiter_returns(runner, 
     monkeypatch.setattr('gateway.status.remove_pid_file', lambda: None)
     monkeypatch.setattr('gateway.status.release_gateway_runtime_lock', lambda: None)
     runner._shutdown_executor = Mock()
+    calls = []
+    async def launch_once():
+        calls.append(True)
+        if runner._detached_restart_helper_started:
+            raise RuntimeError('helper already exists')
+        runner._detached_restart_helper_started = True
+        return True
+    runner._launch_detached_restart_command = launch_once
     async def process_exit_boundary():
         await runner.wait_for_shutdown()
         assert runner._restart_attempt_receipt['outcome'] == 'restart_ready'
     waiter = asyncio.create_task(process_exit_boundary())
     await asyncio.sleep(0)
-    assert runner.request_restart(via_service=True)
+    assert runner.request_restart(via_service=not detached, detached=detached)
     (tmp_path / '.restart_notify.json').write_text(json.dumps({
         'platform': 'telegram', 'chat_id': '42',
         'restart_attempt_id': runner._restart_attempt_id,
@@ -395,6 +404,7 @@ async def test_real_stop_settles_receipt_before_shutdown_waiter_returns(runner, 
     fresh, adapter = make_restart_runner()
     await fresh._send_restart_notification()
     assert adapter.sent
+    assert len(calls) == int(detached)
 
 
 @pytest.mark.asyncio

@@ -190,6 +190,18 @@ async def test_start_gateway_reports_invalid_config_without_traceback(tmp_path, 
 
 
 @pytest.mark.asyncio
+async def test_start_gateway_does_not_hide_unrelated_value_error(tmp_path, monkeypatch):
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    monkeypatch.setattr('gateway.status.get_running_pid', lambda: None)
+    monkeypatch.setattr('hermes_logging.setup_logging', lambda *a, **kw: None)
+    def invalid_runner(config):
+        raise ValueError('unrelated configuration defect')
+    monkeypatch.setattr(gateway_run, 'GatewayRunner', invalid_runner)
+    with pytest.raises(ValueError, match='unrelated configuration defect'):
+        await gateway_run.start_gateway(config=GatewayConfig(), verbosity=None)
+
+
+@pytest.mark.asyncio
 async def test_start_gateway_does_not_start_cron_after_aborted_startup(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     cron_started = False
