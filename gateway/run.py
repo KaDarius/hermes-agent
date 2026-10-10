@@ -11920,6 +11920,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
         while True:
+            if self._running is not True or self._stop_task is not None:
+                self._restart_drain_reason = "shutdown_in_progress"
+                return False
             active = self._restart_work_count()
             self._restart_remaining_work = active
             if active == 0:
@@ -11999,6 +12002,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             if self._restart_hold_reason(attempt_id):
                                 raise RuntimeError("hold changed after helper launch")
                         transition_started = True
+                        self._restart_stop_owner = attempt_id
                         await self.stop(restart=True, detached_restart=detached,
                                         service_restart=via_service)
                         # Only a completed stop may authorize the next process's
@@ -15617,8 +15621,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # stop() signals before its caller resumes. Let the owned restart
         # attempt persist its final receipt before start_gateway can exit.
         restart_task = self._restart_task
-        if restart_task is not None and restart_task is not asyncio.current_task():
-            await restart_task
+        owner = getattr(self, "_restart_stop_owner", None)
+        if (owner is not None and owner == getattr(self, "_restart_attempt_id", None)
+                and restart_task is not None and restart_task is not asyncio.current_task()):
+            try:
+                await asyncio.shield(restart_task)
+            except asyncio.CancelledError:
+                if not restart_task.cancelled():
+                    raise  # cancellation of this waiter still propagates
 
     async def _start_secondary_profile_adapters(self) -> int:
         """Bring up adapters for every non-active profile this gateway serves.

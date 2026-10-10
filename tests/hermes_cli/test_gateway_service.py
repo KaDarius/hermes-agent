@@ -2333,5 +2333,7 @@ def test_graceful_timeout_never_forces_service_restart(monkeypatch, capsys):
     def refuse(*args, **kwargs):
         pytest.fail('graceful timeout must not invoke systemctl fallback')
     monkeypatch.setattr(gateway_cli, '_run_systemctl', refuse)
-    gateway_cli.systemd_restart()
+    with pytest.raises(SystemExit) as exc:
+        gateway_cli.systemd_restart()
+    assert exc.value.code == 1
     assert 'leaving the running service untouched' in capsys.readouterr().out

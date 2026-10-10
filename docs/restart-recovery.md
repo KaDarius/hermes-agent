@@ -35,6 +35,9 @@ not establish non-destructive updater behavior.
 Detached helpers refuse to run their restart command if the original process
 still exists when their deadline expires. This is not a guarantee that all
 other restart commands or supervisor actions are non-destructive.
+If a detached helper reaches that deadline before teardown finishes, it exits
+without restarting; the gateway may subsequently stop and require operator
+recovery. Preserving active work takes priority over automatic availability.
 
 ## Investigation evidence
 
@@ -51,8 +54,9 @@ If a sink fails, available in-memory diagnostics record that failure.
 New restart notification markers carry the attempt ID. A later process may
 announce success only after a matching receipt says the previous stop
 completed. Missing/failed diagnostics cannot authorize a success notification.
-The shutdown waiter awaits the owned restart task so the process exit path
-cannot outrun completed-stop receipt persistence.
+Only a stop initiated by that restart attempt makes the shutdown waiter await
+its final receipt. An unrelated shutdown does not wait for a pending restart
+budget; the restart drain loop refuses when shutdown begins.
 The reader atomically claims a marker before delivery and cleans only that
 claimed file; another command's newer marker and the redelivery dedup record
 survive. Legacy markers retain their existing notification behavior.
@@ -69,5 +73,8 @@ path and its watchdog. Counters and marker observations do not establish global
 writer/admission exclusion across processes; supervisors, out-of-band stop,
 force-mode CLI operations and runtime deployment require separate acceptance.
 Merging source does not install or activate this behavior on any fleet host.
+The new per-attempt files currently have no automatic retention bound.
+An abandoned attempt is recorded in diagnostics; this change does not add
+an asynchronous chat notification when draining is refused.
 
 —Dash

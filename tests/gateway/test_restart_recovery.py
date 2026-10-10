@@ -397,6 +397,27 @@ async def test_real_stop_settles_receipt_before_shutdown_waiter_returns(runner, 
     assert adapter.sent
 
 
+@pytest.mark.asyncio
+async def test_unrelated_shutdown_does_not_wait_for_pending_restart(runner):
+    pending = asyncio.create_task(asyncio.Event().wait())
+    runner._restart_task = pending
+    runner._shutdown_event.set()
+    try:
+        await asyncio.wait_for(runner.wait_for_shutdown(), timeout=2)
+        assert not pending.done()
+    finally:
+        pending.cancel()
+        await asyncio.gather(pending, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_restart_wait_refuses_when_shutdown_begins(runner):
+    runner._running = False
+    runner._restart_after_turn_timeout = 1800
+    assert await asyncio.wait_for(runner._await_active_work_before_restart(), timeout=2) is False
+    assert runner._restart_drain_reason == 'shutdown_in_progress'
+
+
 @pytest.mark.windows_only
 @pytest.mark.asyncio
 async def test_real_windows_helper_double_spawn_failure_returns_false(monkeypatch):
