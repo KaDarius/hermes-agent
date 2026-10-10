@@ -365,6 +365,38 @@ async def test_invalid_budget_chat_returns_refusal(runner):
     runner.stop.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_real_stop_settles_receipt_before_shutdown_waiter_returns(runner, monkeypatch, tmp_path):
+    from unittest.mock import Mock
+    runner._running_agents.clear()
+    runner.stop = gateway_run.GatewayRunner.stop.__get__(runner)
+    # Exercise real teardown and event ordering, isolate all external cleanup.
+    monkeypatch.setattr('tools.process_registry.process_registry.kill_all', lambda: [])
+    monkeypatch.setattr('tools.terminal_tool.cleanup_all_environments', lambda: None)
+    monkeypatch.setattr('tools.browser_tool.cleanup_all_browsers', lambda: None)
+    monkeypatch.setattr('agent.auxiliary_client.shutdown_cached_clients', lambda: None)
+    monkeypatch.setattr('gateway.status.remove_pid_file', lambda: None)
+    monkeypatch.setattr('gateway.status.release_gateway_runtime_lock', lambda: None)
+    runner._shutdown_executor = Mock()
+    async def process_exit_boundary():
+        await runner.wait_for_shutdown()
+        assert runner._restart_attempt_receipt['outcome'] == 'restart_ready'
+    waiter = asyncio.create_task(process_exit_boundary())
+    await asyncio.sleep(0)
+    assert runner.request_restart(via_service=True)
+    (tmp_path / '.restart_notify.json').write_text(json.dumps({
+        'platform': 'telegram', 'chat_id': '42',
+        'restart_attempt_id': runner._restart_attempt_id,
+    }))
+    results = await asyncio.gather(waiter, runner._restart_task, return_exceptions=True)
+    for result in results:
+        if isinstance(result, BaseException):
+            raise result
+    fresh, adapter = make_restart_runner()
+    await fresh._send_restart_notification()
+    assert adapter.sent
+
+
 @pytest.mark.windows_only
 @pytest.mark.asyncio
 async def test_real_windows_helper_double_spawn_failure_returns_false(monkeypatch):

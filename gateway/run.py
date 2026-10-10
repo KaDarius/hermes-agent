@@ -15614,6 +15614,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     async def wait_for_shutdown(self) -> None:
         """Wait for shutdown signal."""
         await self._shutdown_event.wait()
+        # stop() signals before its caller resumes. Let the owned restart
+        # attempt persist its final receipt before start_gateway can exit.
+        restart_task = self._restart_task
+        if restart_task is not None and restart_task is not asyncio.current_task():
+            await restart_task
 
     async def _start_secondary_profile_adapters(self) -> int:
         """Bring up adapters for every non-active profile this gateway serves.

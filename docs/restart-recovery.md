@@ -28,7 +28,10 @@ retry. Wait for startup to finish before making a new explicit restart request.
 A stuck startup needs a separately reviewed operator procedure: this change
 does not introduce a startup-abort mechanism.
 
-The systemd graceful-wait timeout leaves the running service untouched.
+The `hermes_cli.gateway.systemd_restart` graceful-wait timeout leaves the
+running service untouched. The separate `hermes update` restart machinery
+is unchanged: it can fall back to a budget and force-restart. This PR does
+not establish non-destructive updater behavior.
 Detached helpers refuse to run their restart command if the original process
 still exists when their deadline expires. This is not a guarantee that all
 other restart commands or supervisor actions are non-destructive.
@@ -48,6 +51,8 @@ If a sink fails, available in-memory diagnostics record that failure.
 New restart notification markers carry the attempt ID. A later process may
 announce success only after a matching receipt says the previous stop
 completed. Missing/failed diagnostics cannot authorize a success notification.
+The shutdown waiter awaits the owned restart task so the process exit path
+cannot outrun completed-stop receipt persistence.
 The reader atomically claims a marker before delivery and cleans only that
 claimed file; another command's newer marker and the redelivery dedup record
 survive. Legacy markers retain their existing notification behavior.
