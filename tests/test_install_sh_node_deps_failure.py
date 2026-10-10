@@ -57,6 +57,10 @@ exit 0
 """,
     )
     _write_executable(managed_bin / "uv", "#!/bin/sh\necho 'uv probe'\n")
+    # Exercise npm installs without disabling the entire node-deps stage.
+    # Browser and CLI prerequisites are private executable fixtures, not downloads.
+    _write_executable(bin_dir / "browser", "#!/bin/sh\nexit 0\n")
+    _write_executable(managed_bin / "browser-use", "#!/bin/sh\nexit 0\n")
 
     env = os.environ.copy()
     env.update(
@@ -65,6 +69,7 @@ exit 0
             "HERMES_INSTALL_DIR": str(install_dir),
             "NPM_CALLS": str(npm_calls),
             "NPM_FAIL_DIRECTORY": fail_directory or "",
+            "AGENT_BROWSER_EXECUTABLE_PATH": str(bin_dir / "browser"),
             "PATH": f"{bin_dir}:{env['PATH']}",
         }
     )
@@ -75,7 +80,6 @@ exit 0
             "--stage",
             "node-deps",
             "--json",
-            "--skip-browser",
             "--skip-computer-use",
         ],
         cwd=REPO_ROOT,
@@ -84,6 +88,7 @@ exit 0
         text=True,
         check=False,
     )
+    assert npm_calls.exists(), (proc.returncode, proc.stdout, proc.stderr)
     calls = npm_calls.read_text(encoding="utf-8").splitlines()
     return proc, install_dir, calls
 

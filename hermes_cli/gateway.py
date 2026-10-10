@@ -33,6 +33,7 @@ PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 from gateway.config import coerce_systemd_watchdog_seconds, load_gateway_config
 from gateway.status import terminate_pid
 from gateway.restart import (
+    InvalidRestartTimeout,
     DEFAULT_GATEWAY_RESTART_AFTER_TURN_TIMEOUT,
     DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
     EXTERNAL_GATEWAY_SUPERVISOR_ENV,
@@ -304,7 +305,8 @@ def _graceful_restart_via_sigusr1(pid: int, drain_timeout: float) -> bool:
     Returns:
         True if the PID was signalled and exited within the timeout.
         False if SIGUSR1 couldn't be sent or the process didn't exit in
-        time (caller should fall back to a harder restart path).
+        time. Callers must choose their own refusal policy; False does not
+        authorize interrupting active work.
     """
     if not hasattr(signal, "SIGUSR1"):
         return False
@@ -2344,6 +2346,14 @@ def get_systemd_unit_path(system: bool = False) -> Path:
     return Path.home() / ".config" / "systemd" / "user" / f"{name}.service"
 
 
+class RestartRefusedError(Exception):
+    """A safe restart refusal; only the CLI boundary translates it to exit."""
+
+    def __init__(self, exit_code: int):
+        super().__init__("restart refused; service left running")
+        self.exit_code = exit_code
+
+
 class UserSystemdUnavailableError(RuntimeError):
     """Raised when ``systemctl --user`` cannot reach the user D-Bus session.
 
@@ -4166,7 +4176,11 @@ def systemd_restart(system: bool = False):
     if pid is not None:
         scope_label = _service_scope_label(system).capitalize()
         svc = get_service_name()
-        wait_budget = _get_restart_exit_wait_budget()
+        try:
+            wait_budget = _get_restart_exit_wait_budget()
+        except InvalidRestartTimeout:
+            print("Restart refused: invalid restart timeout configuration; service left running.")
+            raise RestartRefusedError(exit_code=2) from None
         print(
             f"⏳ {scope_label} service restarting gracefully (PID {pid}) — "
             f"waiting up to {wait_budget:.0f}s for in-flight turns + drain..."
@@ -4211,8 +4225,9 @@ def systemd_restart(system: bool = False):
         else:
             print(
                 f"⚠ Graceful restart did not complete within {int(wait_budget)}s; "
-                "forcing a service restart..."
+                "leaving the running service untouched; inspect restart-attempt diagnostics."
             )
+            raise RestartRefusedError(exit_code=1)
 
         _run_systemctl(
             ["reset-failed", svc],
@@ -7448,6 +7463,8 @@ def gateway_setup():
                     _print_system_scope_remediation("restart")
                 except subprocess.CalledProcessError as e:
                     print_error(f"  Restart failed: {e}")
+                except RestartRefusedError as e:
+                    print_error(f"  Restart failed: {e}")
         elif service_installed:
             if supports_systemd_services() and _system_scope_wizard_would_need_root():
                 _print_system_scope_remediation("start")
@@ -7669,6 +7686,8 @@ def gateway_command(args):
     """Handle gateway subcommands."""
     try:
         return _gateway_command_inner(args)
+    except RestartRefusedError as e:
+        sys.exit(e.exit_code)
     except UserSystemdUnavailableError as e:
         # Clean, actionable message instead of a traceback when the user D-Bus
         # session is unreachable (fresh SSH shell, no linger, container, etc.).

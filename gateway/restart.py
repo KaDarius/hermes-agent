@@ -1,6 +1,7 @@
 """Shared gateway restart constants and supervisor detection helpers."""
 
 import os
+import math
 from collections.abc import Mapping
 
 from hermes_cli.config import DEFAULT_CONFIG
@@ -93,21 +94,23 @@ def parse_restart_drain_timeout(raw: object) -> float:
     return max(0.0, value)
 
 
-def parse_restart_after_turn_timeout(raw: object) -> float:
-    """Parse the after-turn wait cap for in-band restart, falling back to default.
+class InvalidRestartTimeout(ValueError):
+    """Invalid after-turn budget, distinguishable at startup boundaries."""
 
-    ``0`` is a deliberate disable (legacy immediate drain) and must not fall
-    through to the default — unlike empty/missing input.
-    """
-    if raw is None:
+
+def parse_restart_after_turn_timeout(raw: object) -> float:
+    """Preserve valid explicit budgets; reject invalid input before lifecycle work."""
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
         return DEFAULT_GATEWAY_RESTART_AFTER_TURN_TIMEOUT
-    if isinstance(raw, str) and not raw.strip():
-        return DEFAULT_GATEWAY_RESTART_AFTER_TURN_TIMEOUT
+    if isinstance(raw, bool):
+        raise InvalidRestartTimeout("invalid restart after-turn timeout")
     try:
         value = float(raw)
-    except (TypeError, ValueError):
-        return DEFAULT_GATEWAY_RESTART_AFTER_TURN_TIMEOUT
-    return max(0.0, value)
+    except (TypeError, ValueError, OverflowError):
+        raise InvalidRestartTimeout("invalid restart after-turn timeout") from None
+    if not math.isfinite(value) or value < 0:
+        raise InvalidRestartTimeout("invalid restart after-turn timeout")
+    return value
 
 
 def parse_cron_drain_timeout(raw: object) -> float:

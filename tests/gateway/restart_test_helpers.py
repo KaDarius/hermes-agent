@@ -54,6 +54,8 @@ def make_restart_source(
 def make_restart_runner(
     adapter: BasePlatformAdapter | None = None,
 ) -> tuple[GatewayRunner, BasePlatformAdapter]:
+    # Model a running gateway whose cron subsystem has initialized.
+    import cron.scheduler
     runner = object.__new__(GatewayRunner)
     runner.config = GatewayConfig(
         platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")}

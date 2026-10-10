@@ -14,7 +14,7 @@ truthy string), so the probe must treat ``"0"`` as not-under-launchd:
 routing an unsupervised interactive gateway to the service path would
 make it exit non-zero with nothing to revive it.
 """
-from unittest.mock import MagicMock
+from unittest.mock import ANY, MagicMock
 
 import pytest
 
@@ -62,7 +62,7 @@ async def test_restart_with_external_supervisor_marker_uses_service_path(
 
     await runner._handle_restart_command(_make_restart_event())
 
-    runner.request_restart.assert_called_once_with(detached=False, via_service=True)
+    runner.request_restart.assert_called_once_with(detached=False, via_service=True, attempt_id=ANY)
 
 
 @pytest.mark.asyncio
@@ -75,4 +75,4 @@ async def test_false_external_supervisor_marker_keeps_detached_path(
 
     await runner._handle_restart_command(_make_restart_event())
 
-    runner.request_restart.assert_called_once_with(detached=True, via_service=False)
+    runner.request_restart.assert_called_once_with(detached=True, via_service=False, attempt_id=ANY)
