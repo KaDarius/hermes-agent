@@ -113,7 +113,7 @@ async def test_external_marker_acquired_during_wait_survives(runner):
 async def test_unknown_counter_is_not_idle(runner, monkeypatch):
     import cron.scheduler
     runner._running_agents.clear()
-    monkeypatch.setattr(cron.scheduler, 'get_running_admission_count', lambda: None)
+    monkeypatch.setattr(cron.scheduler, 'get_running_admission_count', lambda *, blocking=True: None)
     runner.request_restart()
     await runner._restart_task
     runner.stop.assert_not_awaited()
@@ -198,7 +198,7 @@ async def test_unreadable_marker_never_reopens(runner, monkeypatch):
 @pytest.mark.asyncio
 async def test_invalid_runtime_budget_changes_no_admission(runner):
     runner._restart_after_turn_timeout = float('inf')
-    with pytest.raises(ValueError): runner.request_restart()
+    assert runner.request_restart() is False
     assert runner._draining is False
     assert runner._restart_requested is False
 
@@ -307,11 +307,62 @@ async def test_notification_cleanup_preserves_replacement(tmp_path, monkeypatch)
 
 def test_invalid_budget_diagnostic_is_private(runner, tmp_path):
     runner._restart_after_turn_timeout = 'private-token-value'
-    with pytest.raises(ValueError): runner.request_restart()
+    assert runner.request_restart() is False
     data = [json.loads(p.read_text()) for p in (tmp_path / 'logs' / 'restart_attempts').glob('*.json')]
     assert len(data) == 1
     assert data[0]['reason'] == 'invalid_timeout'
     assert 'private-token-value' not in json.dumps(data)
+
+
+@pytest.mark.asyncio
+async def test_proven_missing_binary_recovers_owned_intake(runner, monkeypatch):
+    runner._running_agents.clear()
+    runner._launch_detached_restart_command = gateway_run.GatewayRunner._launch_detached_restart_command.__get__(runner)
+    monkeypatch.setattr(gateway_run, '_resolve_hermes_bin', lambda: [])
+    assert runner.request_restart(detached=True)
+    await runner._restart_task
+    runner.stop.assert_not_awaited()
+    assert runner._draining is False
+    assert runner._restart_task_started is False
+    assert runner._restart_attempt_receipt['recovery'] == 'intake_restored'
+
+
+@pytest.mark.asyncio
+async def test_existing_helper_keeps_intake_held(runner, monkeypatch):
+    runner._running_agents.clear()
+    runner._detached_restart_helper_started = True
+    runner._launch_detached_restart_command = gateway_run.GatewayRunner._launch_detached_restart_command.__get__(runner)
+    monkeypatch.setattr(gateway_run, '_resolve_hermes_bin', lambda: [])
+    assert runner.request_restart(detached=True)
+    await runner._restart_task
+    runner.stop.assert_not_awaited()
+    assert runner._draining is True
+
+
+@pytest.mark.asyncio
+async def test_no_launch_does_not_release_external_hold(runner):
+    runner._running_agents.clear()
+    async def no_launch():
+        runner._external_drain_active = True
+        return False
+    runner._launch_detached_restart_command = no_launch
+    runner.request_restart(detached=True)
+    await runner._restart_task
+    runner.stop.assert_not_awaited()
+    assert runner._draining is True
+
+
+@pytest.mark.asyncio
+async def test_invalid_budget_chat_returns_refusal(runner):
+    from gateway.platforms.base import MessageEvent, MessageType
+    from tests.gateway.restart_test_helpers import make_restart_source
+    runner._restart_after_turn_timeout = 'invalid'
+    event = MessageEvent(text='/restart', message_type=MessageType.TEXT,
+                         source=make_restart_source(), message_id='invalid-budget')
+    reply = await runner._handle_restart_command(event)
+    assert 'refused' in reply.lower()
+    assert runner._draining is False
+    runner.stop.assert_not_awaited()
 
 
 @pytest.mark.windows_only
@@ -323,6 +374,7 @@ async def test_real_windows_helper_double_spawn_failure_returns_false(monkeypatc
     def fail(*args, **kwargs): raise OSError('private spawn details')
     monkeypatch.setattr(subprocess, 'Popen', fail)
     assert await r._launch_detached_restart_command() is False
+    assert r._detached_restart_helper_started is False
 
 
 @pytest.mark.macos_only

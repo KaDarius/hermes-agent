@@ -2305,6 +2305,23 @@ class TestRetryLaunchctlBootstrapUntilRegistered:
         assert list_calls["n"] >= 1
 
 
+def test_invalid_restart_budget_refuses_before_signal(monkeypatch, capsys):
+    monkeypatch.setattr(gateway_cli, '_select_systemd_scope', lambda *a, **kw: False)
+    monkeypatch.setattr(gateway_cli, '_require_service_installed', lambda *a, **kw: None)
+    monkeypatch.setattr(gateway_cli, '_preflight_user_systemd', lambda **kw: None)
+    monkeypatch.setattr(gateway_cli, 'refresh_systemd_unit_if_needed', lambda **kw: None)
+    monkeypatch.setattr(status, 'get_running_pid', lambda **kw: 654)
+    monkeypatch.setenv('HERMES_RESTART_AFTER_TURN_TIMEOUT', 'invalid-private-value')
+    def refuse(*args, **kwargs):
+        pytest.fail('invalid budget must not signal or restart')
+    monkeypatch.setattr(gateway_cli, '_graceful_restart_via_sigusr1', refuse)
+    monkeypatch.setattr(gateway_cli, '_run_systemctl', refuse)
+    with pytest.raises(SystemExit) as exc:
+        gateway_cli.systemd_restart()
+    assert exc.value.code == 2
+    assert 'invalid-private-value' not in capsys.readouterr().out
+
+
 def test_graceful_timeout_never_forces_service_restart(monkeypatch, capsys):
     monkeypatch.setattr(gateway_cli, '_select_systemd_scope', lambda *a, **kw: False)
     monkeypatch.setattr(gateway_cli, '_require_service_installed', lambda *a, **kw: None)

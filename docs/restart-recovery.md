@@ -5,6 +5,10 @@ new messages while existing work finishes. `agent.restart_after_turn_timeout`
 is the wait budget: an explicit finite, nonnegative value is preserved; an
 unset value uses 300 seconds. Zero refuses immediately if work remains.
 Invalid values are rejected rather than silently replaced.
+An invalid runtime budget returns a refusal to chat/signal callers before
+changing admission. Invalid startup configuration refuses startup with an
+error log (the supervisor may retry); the CLI reports a nonzero configuration
+error instead of a traceback. Correct the configuration before retrying.
 
 If work fails to drain, the gateway does not launch the detached helper or
 call `stop()`. It abandons that attempt and restores only the intake pause
@@ -13,6 +17,10 @@ shutdown, external drain marker, or maintenance hold intervened. Unknown hold
 state preserves the pause. Recovery is evaluated once; it does not retry the
 restart, replay queued work, or release another owner's hold. A later explicit
 restart is a new attempt. Wedged work is not permission to interrupt it.
+An explicit no-helper-created result (missing executable or both Windows
+spawn attempts failing) permits the same owned-intake recovery. A previously
+started helper, an exception, or an unknown launch result retains the pause:
+absence of a verified launch is not proof that no helper exists.
 
 A restart requested while platform connections are still starting is refused
 with `existing_lifecycle_transition`; it does not stop startup or schedule a

@@ -11612,11 +11612,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         import shutil
         import subprocess
 
+        # False is proof that this attempt created no helper. An existing
+        # helper is uncertain transition ownership, never recovery authority.
+        if self._detached_restart_helper_started:
+            raise RuntimeError("restart helper already exists")
         hermes_cmd = _resolve_hermes_bin()
         if not hermes_cmd:
             logger.error("Could not locate hermes binary for detached /restart")
-            return False
-        if self._detached_restart_helper_started:
             return False
         self._detached_restart_helper_started = True
 
@@ -11763,6 +11765,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         error_field,
                         error_code,
                     )
+                    self._detached_restart_helper_started = False
                     return False
             return True
 
@@ -11953,7 +11956,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             budget = parse_restart_after_turn_timeout(self._restart_after_turn_timeout)
         except ValueError:
             reject("invalid_timeout")
-            raise
+            return False
         self._restart_attempt_id = attempt_id
         self._restart_requested = True
         self._restart_detached = detached
@@ -11986,7 +11989,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     else:
                         if detached:
                             helper_attempted = True
-                            if await self._launch_detached_restart_command() is not True:
+                            launched = await self._launch_detached_restart_command()
+                            if launched is False:
+                                # Explicit no-launch proof only. Exceptions and
+                                # unknown results keep the conservative hold.
+                                helper_attempted = False
+                            if launched is not True:
                                 raise RuntimeError("helper launch unverified")
                             if self._restart_hold_reason(attempt_id):
                                 raise RuntimeError("hold changed after helper launch")
@@ -31177,7 +31185,11 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         if _stderr_level < logging.getLogger().level:
             logging.getLogger().setLevel(_stderr_level)
 
-    runner = GatewayRunner(config)
+    try:
+        runner = GatewayRunner(config)
+    except ValueError:
+        logger.error("Invalid gateway configuration; startup refused. Check restart timeout settings.")
+        return False
     # ``--replace`` is explicit startup authority, not a durable reconnect
     # policy. GatewayRunner scopes this bit to cold adapter connects and clears
     # it before the background reconnect watcher starts.

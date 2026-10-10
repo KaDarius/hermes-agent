@@ -4166,7 +4166,11 @@ def systemd_restart(system: bool = False):
     if pid is not None:
         scope_label = _service_scope_label(system).capitalize()
         svc = get_service_name()
-        wait_budget = _get_restart_exit_wait_budget()
+        try:
+            wait_budget = _get_restart_exit_wait_budget()
+        except ValueError:
+            print("Restart refused: invalid restart timeout configuration; service left running.")
+            raise SystemExit(2) from None
         print(
             f"⏳ {scope_label} service restarting gracefully (PID {pid}) — "
             f"waiting up to {wait_budget:.0f}s for in-flight turns + drain..."

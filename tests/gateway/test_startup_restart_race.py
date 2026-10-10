@@ -176,6 +176,20 @@ async def test_startup_refuses_restart_during_platform_connect(tmp_path, monkeyp
 
 
 @pytest.mark.asyncio
+async def test_start_gateway_reports_invalid_config_without_traceback(tmp_path, monkeypatch, caplog):
+    from gateway.restart import parse_restart_after_turn_timeout
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
+    monkeypatch.setattr("hermes_logging.setup_logging", lambda *a, **kw: None)
+    def invalid_runner(config):
+        parse_restart_after_turn_timeout('invalid-private-value')
+    monkeypatch.setattr(gateway_run, 'GatewayRunner', invalid_runner)
+    assert await gateway_run.start_gateway(config=GatewayConfig(), verbosity=None) is False
+    assert 'configuration' in caplog.text.lower()
+    assert 'invalid-private-value' not in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_start_gateway_does_not_start_cron_after_aborted_startup(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     cron_started = False
