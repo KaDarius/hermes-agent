@@ -1723,6 +1723,7 @@ class GatewaySlashCommandsMixin:
         else:
             accepted = self.request_restart(detached=True, via_service=False, attempt_id=self._restart_command_pending)
         if not accepted:
+            self._restart_command_source = None
             return "Restart refused; inspect gateway restart-attempt diagnostics."
         if active_agents:
             return t("gateway.draining", count=active_agents)

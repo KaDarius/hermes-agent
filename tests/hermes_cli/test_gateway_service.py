@@ -2306,6 +2306,7 @@ class TestRetryLaunchctlBootstrapUntilRegistered:
 
 
 def test_invalid_restart_budget_refuses_before_signal(monkeypatch, capsys):
+    monkeypatch.setattr(gateway_cli, 'probe_gateway_loop_liveness', lambda pid: gateway_cli.GATEWAY_LOOP_ALIVE)
     monkeypatch.setattr(gateway_cli, '_select_systemd_scope', lambda *a, **kw: False)
     monkeypatch.setattr(gateway_cli, '_require_service_installed', lambda *a, **kw: None)
     monkeypatch.setattr(gateway_cli, '_preflight_user_systemd', lambda **kw: None)
@@ -2316,13 +2317,15 @@ def test_invalid_restart_budget_refuses_before_signal(monkeypatch, capsys):
         pytest.fail('invalid budget must not signal or restart')
     monkeypatch.setattr(gateway_cli, '_graceful_restart_via_sigusr1', refuse)
     monkeypatch.setattr(gateway_cli, '_run_systemctl', refuse)
-    with pytest.raises(SystemExit) as exc:
+    with pytest.raises(Exception) as exc:
         gateway_cli.systemd_restart()
-    assert exc.value.code == 2
+    assert type(exc.value).__name__ == 'RestartRefusedError'
+    assert exc.value.exit_code == 2
     assert 'invalid-private-value' not in capsys.readouterr().out
 
 
 def test_graceful_timeout_never_forces_service_restart(monkeypatch, capsys):
+    monkeypatch.setattr(gateway_cli, 'probe_gateway_loop_liveness', lambda pid: gateway_cli.GATEWAY_LOOP_ALIVE)
     monkeypatch.setattr(gateway_cli, '_select_systemd_scope', lambda *a, **kw: False)
     monkeypatch.setattr(gateway_cli, '_require_service_installed', lambda *a, **kw: None)
     monkeypatch.setattr(gateway_cli, '_preflight_user_systemd', lambda **kw: None)
@@ -2333,7 +2336,83 @@ def test_graceful_timeout_never_forces_service_restart(monkeypatch, capsys):
     def refuse(*args, **kwargs):
         pytest.fail('graceful timeout must not invoke systemctl fallback')
     monkeypatch.setattr(gateway_cli, '_run_systemctl', refuse)
-    with pytest.raises(SystemExit) as exc:
+    with pytest.raises(Exception) as exc:
         gateway_cli.systemd_restart()
-    assert exc.value.code == 1
+    assert type(exc.value).__name__ == 'RestartRefusedError'
+    assert exc.value.exit_code == 1
     assert 'leaving the running service untouched' in capsys.readouterr().out
+
+
+@pytest.fixture(params=['invalid', 'drain'])
+def refused_restart(request, monkeypatch, tmp_path):
+    monkeypatch.setattr(gateway_cli, '_select_systemd_scope', lambda *a, **kw: False)
+    monkeypatch.setattr(gateway_cli, '_require_service_installed', lambda *a, **kw: None)
+    monkeypatch.setattr(gateway_cli, '_preflight_user_systemd', lambda **kw: None)
+    monkeypatch.setattr(gateway_cli, 'refresh_systemd_unit_if_needed', lambda **kw: None)
+    monkeypatch.setattr(status, 'get_running_pid', lambda **kw: 654)
+    monkeypatch.setattr(gateway_cli, 'probe_gateway_loop_liveness', lambda pid: gateway_cli.GATEWAY_LOOP_ALIVE)
+    def forbidden(*a, **kw):
+        pytest.fail('refused graceful restart must not fall through to service or stop actions')
+    for name in ('_run_systemctl', '_escalate_wedged_gateway', 'stop_profile_gateway',
+                 'kill_gateway_processes', 'get_systemd_linger_status'):
+        monkeypatch.setattr(gateway_cli, name, forbidden)
+    if request.param == 'invalid':
+        monkeypatch.setenv('HERMES_RESTART_AFTER_TURN_TIMEOUT', 'invalid-private-value')
+        monkeypatch.setattr(gateway_cli, '_graceful_restart_via_sigusr1', forbidden)
+    else:
+        monkeypatch.setattr(gateway_cli, '_get_restart_exit_wait_budget', lambda: 305)
+        monkeypatch.setattr(gateway_cli, '_graceful_restart_via_sigusr1', lambda *a: False)
+    monkeypatch.setattr(gateway_cli, 'supports_systemd_services', lambda: True)
+    monkeypatch.setattr(gateway_cli, '_is_service_running', lambda: True)
+    monkeypatch.setattr(gateway_cli, '_is_service_installed', lambda: True)
+    monkeypatch.setattr(gateway_cli, '_system_scope_wizard_would_need_root', lambda: False)
+    monkeypatch.setattr(gateway_cli, 'has_conflicting_systemd_units', lambda: False)
+    monkeypatch.setattr(gateway_cli, 'has_legacy_hermes_units', lambda: False)
+    monkeypatch.setattr(gateway_cli, 'is_managed', lambda: False)
+    monkeypatch.setattr(gateway_cli, '_all_platforms', lambda: [{'emoji': '', 'label': 'test'}])
+    monkeypatch.setattr(gateway_cli, '_platform_status', lambda p: 'configured')
+    monkeypatch.setattr(gateway_cli, 'prompt_choice', lambda *a: 1)
+    monkeypatch.setattr(gateway_cli, 'prompt_yes_no', lambda *a: True)
+    monkeypatch.setattr(gateway_cli, 'get_systemd_unit_path', lambda **kw: tmp_path)
+    return 2 if request.param == 'invalid' else 1
+
+
+def test_gateway_setup_continues_after_real_restart_refusal(refused_restart, capsys):
+    gateway_cli.gateway_setup()
+    assert 'Restart failed' in capsys.readouterr().out
+
+
+def test_setup_wizard_continues_after_real_restart_refusal(refused_restart, monkeypatch, capsys):
+    from hermes_cli import setup
+    monkeypatch.setattr(setup, 'prompt_checklist', lambda *a: [])
+    monkeypatch.setattr(setup, 'prompt_yes_no', lambda *a: True)
+    monkeypatch.setattr(setup, 'get_env_value', lambda *a: '')
+    setup.setup_gateway({})
+    output = capsys.readouterr().out
+    assert 'Restart failed' in output
+    assert 'invalid-private-value' not in output
+
+
+def test_service_manager_propagates_ordinary_refusal(refused_restart):
+    from hermes_cli.service_manager import SystemdServiceManager
+    with pytest.raises(Exception) as exc:
+        SystemdServiceManager().restart('test')
+    assert type(exc.value).__name__ == 'RestartRefusedError'
+    assert exc.value.exit_code == refused_restart
+
+
+def test_cli_refusal_exits_without_fallback(refused_restart, monkeypatch):
+    from tools import process_registry
+    monkeypatch.setattr(process_registry, '_is_supervised_gateway_process', lambda: False)
+    monkeypatch.setattr(gateway_cli, '_dispatch_via_service_manager_if_s6', lambda *a: False)
+    with pytest.raises(SystemExit) as exc:
+        gateway_cli.gateway_command(SimpleNamespace(gateway_command='restart', system=False, **{'all': False}))
+    assert exc.value.code == refused_restart
+
+
+def test_unrelated_restart_value_error_is_not_config_refusal(refused_restart, monkeypatch):
+    def unrelated():
+        raise ValueError('unrelated')
+    monkeypatch.setattr(gateway_cli, '_get_restart_exit_wait_budget', unrelated)
+    with pytest.raises(ValueError, match='unrelated'):
+        gateway_cli.systemd_restart()

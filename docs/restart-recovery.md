@@ -5,6 +5,10 @@ new messages while existing work finishes. `agent.restart_after_turn_timeout`
 is the wait budget: an explicit finite, nonnegative value is preserved; an
 unset value uses 300 seconds. Zero refuses immediately if work remains.
 Invalid values are rejected rather than silently replaced.
+Preserving explicit values means preserving their number, not their former
+behavior: zero previously allowed an immediate restart, but now refuses when
+work remains. Work consisting only of wedged turns also refuses rather than
+being excluded from the wait. Operator recovery may be needed before retrying.
 An invalid runtime budget returns a refusal to chat/signal callers before
 changing admission. Invalid startup configuration refuses startup with an
 error log (the supervisor may retry); the CLI reports a nonzero configuration
@@ -32,6 +36,14 @@ The `hermes_cli.gateway.systemd_restart` graceful-wait timeout leaves the
 running service untouched. The separate `hermes update` restart machinery
 is unchanged: it can fall back to a budget and force-restart. This PR does
 not establish non-destructive updater behavior.
+The shared routine raises an ordinary `RestartRefusedError`; the direct restart
+CLI exits 2 for invalid budgets or 1 for failed graceful handoff. Setup flows
+print the refusal and continue (setup may still exit 0). The service-manager
+adapter propagates the ordinary error. Unit refresh happens before budget
+validation. The pre-existing dead-event-loop escalation, no-PID restart,
+`restart --all`, and launchd timeout force fallback are outside this protection.
+The CLI may wait its full exit budget after the gateway has refused a drain;
+exit 1 can also mean SIGUSR1 could not be sent, not just that the budget expired.
 Detached helpers refuse to run their restart command if the original process
 still exists when their deadline expires. This is not a guarantee that all
 other restart commands or supervisor actions are non-destructive.
@@ -60,6 +72,12 @@ budget; the restart drain loop refuses when shutdown begins.
 The reader atomically claims a marker before delivery and cleans only that
 claimed file; another command's newer marker and the redelivery dedup record
 survive. Legacy markers retain their existing notification behavior.
+Synchronous refusal clears its transient chat source. Marker/dedup writes still
+precede acceptance to prevent a restart-task race; dedup suppresses redelivery
+of the same refused command. A new-format refused marker cannot authorize a
+success notification. A crash after claiming a notification can leave an
+unread claimed file; automatic cleanup and refusal-text localization remain
+followups, not guarantees of this change.
 
 ## Verification and limits
 

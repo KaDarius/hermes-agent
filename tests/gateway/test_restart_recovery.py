@@ -361,6 +361,7 @@ async def test_invalid_budget_chat_returns_refusal(runner):
                          source=make_restart_source(), message_id='invalid-budget')
     reply = await runner._handle_restart_command(event)
     assert 'refused' in reply.lower()
+    assert runner._restart_command_source is None
     assert runner._draining is False
     runner.stop.assert_not_awaited()
 
@@ -443,6 +444,16 @@ async def test_real_windows_helper_double_spawn_failure_returns_false(monkeypatc
 @pytest.mark.macos_only
 @pytest.mark.asyncio
 async def test_detached_shell_deadline_refuses_live_process(monkeypatch, tmp_path):
+    await _assert_detached_shell_deadline_refuses_live_process(monkeypatch, tmp_path)
+
+
+@pytest.mark.linux_only
+@pytest.mark.asyncio
+async def test_linux_detached_shell_deadline_refuses_live_process(monkeypatch, tmp_path):
+    await _assert_detached_shell_deadline_refuses_live_process(monkeypatch, tmp_path)
+
+
+async def _assert_detached_shell_deadline_refuses_live_process(monkeypatch, tmp_path):
     """Execute generated helper under inert shell functions, never a real PID."""
     import subprocess
     r, _ = make_restart_runner()
