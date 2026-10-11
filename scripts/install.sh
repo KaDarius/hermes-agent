@@ -71,6 +71,7 @@ USE_VENV=true
 RUN_SETUP=true
 SKIP_BROWSER=false
 SKIP_COMPUTER_USE=false
+SKIP_NODE_DEPS=false
 NO_SKILLS=false
 BRANCH="main"
 INSTALL_COMMIT=""
@@ -109,6 +110,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --skip-computer-use)
             SKIP_COMPUTER_USE=true
+            shift
+            ;;
+        --skip-node-deps)
+            SKIP_NODE_DEPS=true
             shift
             ;;
         --no-skills)
@@ -171,6 +176,9 @@ while [[ $# -gt 0 ]]; do
             echo "  --skip-setup   Skip interactive setup wizard"
             echo "  --skip-browser Skip Playwright/Chromium install (browser tools won't work)"
             echo "  --skip-computer-use  Skip the cua-driver (Computer Use) install"
+            echo "  --skip-node-deps     Skip the npm install of Node.js and TUI dependencies"
+            echo "                   (offline/sandboxed installs; the TUI won't work until"
+            echo "                   you run npm install yourself)"
             echo "  --no-skills    Start with a blank slate — seed no bundled skills, and"
             echo "                   write \$HERMES_HOME/.no-bundled-skills so future"
             echo "                   'hermes update' runs never inject bundled skills either"
@@ -2416,6 +2424,13 @@ install_node_deps() {
 
     # --skip-browser skips only Playwright/Chromium (handled below), never the
     # Node/TUI dependency install itself: the TUI needs ui-tui's node_modules.
+    # Skipping npm entirely is its own explicit opt-out.
+    if [ "$SKIP_NODE_DEPS" = true ]; then
+        log_info "Skipping Node.js and TUI dependencies (--skip-node-deps)"
+        log_info "Run later: cd $INSTALL_DIR && npm install"
+        return 0
+    fi
+
     if [ -f "$INSTALL_DIR/package.json" ]; then
         log_info "Installing Node.js dependencies (browser tools)..."
         cd "$INSTALL_DIR"

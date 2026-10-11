@@ -21,6 +21,7 @@ def _run_node_deps_stage(
     tmp_path: Path,
     *,
     fail_directory: str | None,
+    extra_flags: tuple[str, ...] = (),
 ) -> tuple[subprocess.CompletedProcess[str], Path, list[str]]:
     install_dir = tmp_path / "install"
     tui_dir = install_dir / "ui-tui"
@@ -77,6 +78,7 @@ exit 0
             "--json",
             "--skip-browser",
             "--skip-computer-use",
+            *extra_flags,
         ],
         cwd=REPO_ROOT,
         env=env,
@@ -84,7 +86,11 @@ exit 0
         text=True,
         check=False,
     )
-    calls = npm_calls.read_text(encoding="utf-8").splitlines()
+    calls = (
+        npm_calls.read_text(encoding="utf-8").splitlines()
+        if npm_calls.exists()
+        else []
+    )
     return proc, install_dir, calls
 
 
@@ -143,3 +149,24 @@ def test_node_dependency_success_remains_successful(tmp_path: Path) -> None:
     assert calls == [str(install_dir), str(install_dir / "ui-tui")]
     assert "Node.js dependencies installed" in proc.stdout
     assert "TUI dependencies installed" in proc.stdout
+
+
+def test_skip_node_deps_opt_out_never_invokes_npm(tmp_path: Path) -> None:
+    install_dir = tmp_path / "install"
+    # A would-be failure proves npm is not reached: the stage stays green.
+    proc, _, calls = _run_node_deps_stage(
+        tmp_path,
+        fail_directory=str(install_dir),
+        extra_flags=("--skip-node-deps",),
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert _stage_result(proc) == {
+        "ok": True,
+        "stage": "node-deps",
+        "skipped": False,
+    }
+    assert calls == []
+    assert "Skipping Node.js and TUI dependencies (--skip-node-deps)" in proc.stdout
+    assert "Node.js dependencies installed" not in proc.stdout
+    assert "TUI dependencies installed" not in proc.stdout
