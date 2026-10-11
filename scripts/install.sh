@@ -2414,11 +2414,8 @@ install_node_deps() {
         return 0
     fi
 
-    if [ "$SKIP_BROWSER" = true ]; then
-        log_info "Skipping Node.js dependencies (--skip-browser)"
-        return 0
-    fi
-
+    # --skip-browser skips only Playwright/Chromium (handled below), never the
+    # Node/TUI dependency install itself: the TUI needs ui-tui's node_modules.
     if [ -f "$INSTALL_DIR/package.json" ]; then
         log_info "Installing Node.js dependencies (browser tools)..."
         cd "$INSTALL_DIR"
