@@ -197,6 +197,12 @@ install_in_sandbox() {
   if [ -z "$ref" ] || installer_supports "$ref" --skip-browser; then
     installer_flags+=(--skip-browser)
   fi
+  # npm install fails inside this sandbox (run 38122692643), and installers
+  # that treat that as fatal would abort here. Opt out explicitly where the
+  # installer supports it; --skip-browser does not skip npm.
+  if [ -z "$ref" ] || installer_supports "$ref" --skip-node-deps; then
+    installer_flags+=(--skip-node-deps)
+  fi
   # Sandbox flags must precede `--`; the rest goes to install.sh.
   args+=(-- "${installer_flags[@]}")
 
