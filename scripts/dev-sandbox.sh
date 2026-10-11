@@ -20,7 +20,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # script into the store on its own, so it exports DEV_SANDBOX_ASSETS to point
 # here.
 SANDBOX_ASSETS="${DEV_SANDBOX_ASSETS:-$SCRIPT_DIR/sandbox}"
-for asset in proxy.py ssh-shim.sh openssl.cnf stage2-run.sh tls-preflight.py; do
+for asset in proxy.py ssh-shim.sh openssl.cnf stage2-run.sh tls-preflight.py build-trust-bundle.sh; do
   [ -f "$SANDBOX_ASSETS/$asset" ] || {
     echo "error: missing sandbox asset: $SANDBOX_ASSETS/$asset" >&2
     exit 1
@@ -444,15 +444,8 @@ if [ ! -f "$SANDBOX_ROOT/root/certs/ca.pem" ]; then
     exit 1
   fi
 fi
-# Clients trust certs/trust.pem: the sandbox CA (for MITM-ed fixture hosts)
-# plus the real system roots (for hosts the proxy tunnels). uv treats
-# SSL_CERT_FILE as its ONLY trust source, so pointing it at ca.pem alone made
-# every tunneled host fail with UnknownIssuer. ca.pem stays the proxy's
-# signing CA and real-ca.pem its upstream trust store; nothing here relaxes
-# verification. Rebuilt every run so a regenerated ca.pem is never stale.
-trust_tmp="$SANDBOX_ROOT/root/certs/trust.pem.tmp"
-cat "$SANDBOX_ROOT/root/certs/ca.pem" "$SANDBOX_ROOT/root/certs/real-ca.pem" > "$trust_tmp"
-mv -f "$trust_tmp" "$SANDBOX_ROOT/root/certs/trust.pem"
+# Clients trust certs/trust.pem (sandbox CA + real roots); see the script.
+"$SANDBOX_ASSETS/build-trust-bundle.sh" "$SANDBOX_ROOT/root/certs"
 GIT_UPLOAD_PACK="$(command -v git-upload-pack)"
 sed "s|@GIT_UPLOAD_PACK@|$GIT_UPLOAD_PACK|" "$SANDBOX_ASSETS/ssh-shim.sh" \
   > "$SANDBOX_ROOT/root/usr/bin/ssh"
