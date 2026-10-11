@@ -68,6 +68,10 @@ cd "$REPO_ROOT"
 # relative directory name.
 SANDBOX_DIR_NAME=".hermes-sandbox-e2e-$ROUTE"
 export HERMES_DEV_SANDBOX_DIR="$SANDBOX_DIR_NAME"
+# Every sandbox start proves the proxy's passthrough hosts verify against
+# SSL_CERT_FILE alone (uv's exclusive trust model); github.com serves the
+# python-build-standalone download uv fetches. Overridable, never disabled here.
+export HERMES_DEV_SANDBOX_TLS_PREFLIGHT="${HERMES_DEV_SANDBOX_TLS_PREFLIGHT:-github.com}"
 
 SANDBOX_ROOT="$REPO_ROOT/$SANDBOX_DIR_NAME"
 INSTALL_DIR="/home/hermes/.hermes/hermes-agent"   # user-level layout (sandbox default)
