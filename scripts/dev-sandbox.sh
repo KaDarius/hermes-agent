@@ -20,7 +20,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # script into the store on its own, so it exports DEV_SANDBOX_ASSETS to point
 # here.
 SANDBOX_ASSETS="${DEV_SANDBOX_ASSETS:-$SCRIPT_DIR/sandbox}"
-for asset in proxy.py ssh-shim.sh openssl.cnf stage2-run.sh; do
+for asset in proxy.py ssh-shim.sh openssl.cnf stage2-run.sh tls-preflight.py build-trust-bundle.sh; do
   [ -f "$SANDBOX_ASSETS/$asset" ] || {
     echo "error: missing sandbox asset: $SANDBOX_ASSETS/$asset" >&2
     exit 1
@@ -444,6 +444,8 @@ if [ ! -f "$SANDBOX_ROOT/root/certs/ca.pem" ]; then
     exit 1
   fi
 fi
+# Clients trust certs/trust.pem (sandbox CA + real roots); see the script.
+"$SANDBOX_ASSETS/build-trust-bundle.sh" "$SANDBOX_ROOT/root/certs"
 GIT_UPLOAD_PACK="$(command -v git-upload-pack)"
 sed "s|@GIT_UPLOAD_PACK@|$GIT_UPLOAD_PACK|" "$SANDBOX_ASSETS/ssh-shim.sh" \
   > "$SANDBOX_ROOT/root/usr/bin/ssh"
@@ -453,6 +455,7 @@ chmod 700 "$SANDBOX_ROOT/root/usr/bin/ssh"
 # scripts/sandbox/ rather than heredocs, so they can be linted, syntax-checked
 # and diffed like any other source. Copy them into the sandbox tree.
 cp "$SANDBOX_ASSETS/proxy.py" "$SANDBOX_ROOT/root/proxy.py"
+cp "$SANDBOX_ASSETS/tls-preflight.py" "$SANDBOX_ROOT/root/tls-preflight.py"
 
 if [ -n "$INSTALL_REF" ]; then
   echo "[sandbox] fake main: upstream $INSTALL_REF ($UPSTREAM_COMMIT)" >&2
@@ -546,6 +549,7 @@ env \
   DEV_SANDBOX_XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-}" \
   DEV_SANDBOX_WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-}" \
   DEV_SANDBOX_WAYLAND_SOCKET="$WAYLAND_SOCKET" \
+  DEV_SANDBOX_TLS_PREFLIGHT="${HERMES_DEV_SANDBOX_TLS_PREFLIGHT:-}" \
   unshare "${netns_args[@]}" \
     "$SANDBOX_ASSETS/stage2-run.sh" "$@" &
 sandbox_launcher=$!

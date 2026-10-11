@@ -213,17 +213,18 @@ exec bwrap \
   --setenv HOME "$DEV_SANDBOX_HOME" \
   --setenv USER "$DEV_SANDBOX_USER" \
   --setenv LOGNAME "$DEV_SANDBOX_USER" \
-  --setenv CURL_CA_BUNDLE /work/certs/ca.pem \
-  --setenv SSL_CERT_FILE /work/certs/ca.pem \
-  --setenv GIT_SSL_CAINFO /work/certs/ca.pem \
+  --setenv CURL_CA_BUNDLE /work/certs/trust.pem \
+  --setenv SSL_CERT_FILE /work/certs/trust.pem \
+  --setenv GIT_SSL_CAINFO /work/certs/trust.pem \
   --setenv NODE_EXTRA_CA_CERTS /work/certs/ca.pem \
-  --setenv npm_config_cafile /work/certs/ca.pem \
+  --setenv npm_config_cafile /work/certs/trust.pem \
   --setenv OPENSSL_CONF /work/certs/openssl.cnf \
   --setenv HTTP_PROXY http://127.0.0.1:8080 \
   --setenv HTTPS_PROXY http://127.0.0.1:8080 \
   --setenv ALL_PROXY http://127.0.0.1:8080 \
   --setenv NO_PROXY '' \
   --setenv DEV_SANDBOX_INTERACTIVE "$DEV_SANDBOX_INTERACTIVE" \
+  --setenv DEV_SANDBOX_TLS_PREFLIGHT "${DEV_SANDBOX_TLS_PREFLIGHT:-}" \
   --setenv ELECTRON_DISABLE_SANDBOX 1 \
   "${node_env[@]}" \
   "${electron_env[@]}" \
@@ -247,6 +248,13 @@ exec bwrap \
       echo "error: the sandbox fake-internet proxy never came up" >&2
       cat /work/logs/proxy.log >&2 || true
       exit 1
+    fi
+    # Opt-in (HERMES_DEV_SANDBOX_TLS_PREFLIGHT="github.com ..."): prove each
+    # passthrough host verifies against SSL_CERT_FILE alone, so a trust-bundle
+    # regression fails here, loudly, not as UnknownIssuer mid-install.
+    if [ -n "${DEV_SANDBOX_TLS_PREFLIGHT:-}" ]; then
+      # shellcheck disable=SC2086  # a space-separated host list, split on purpose
+      python3 /work/tls-preflight.py $DEV_SANDBOX_TLS_PREFLIGHT
     fi
     "$@"
   ' sandbox-command "$@"
